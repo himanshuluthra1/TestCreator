@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Configure Comparison – Excel Comparator</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>📊 Excel File Comparator</h1>
+      <p class="subtitle">Configure the column comparisons between your two files.</p>
+    </header>
+
+    <div class="file-info">
+      <span class="badge">File 1: {{ original1 }}</span>
+      <span class="badge">File 2: {{ original2 }}</span>
+      <a href="/" class="link-reset">← Upload different files</a>
+    </div>
+
+    {% if errors %}
+    <div class="alert alert-error">
+      <ul>
+        {% for e in errors %}<li>{{ e }}</li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    <form action="/compare" method="post" id="compareForm">
+      <div id="criteria-container">
+        <!-- Criteria rows are added here by JS -->
+      </div>
+
+      <div class="actions">
+        <button type="button" id="addCriteria" class="btn btn-secondary">+ Add Comparison Column</button>
+        <button type="submit" class="btn btn-primary">Compare &amp; Download →</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Template for a single criterion row (cloned by JS) -->
+  <template id="criterionTemplate">
+    <div class="criterion-row" data-index="__INDEX__">
+      <div class="criterion-header">
+        <span class="criterion-label">Criterion <span class="criterion-num">1</span></span>
+        <button type="button" class="btn-remove" aria-label="Remove criterion">✕</button>
+      </div>
+      <div class="criterion-body">
+        <div class="form-group">
+          <label>Column in File 1 (<em>{{ original1 }}</em>)</label>
+          <select name="col1___INDEX__" class="col1-select" required>
+            <option value="">— select column —</option>
+            {% for c in cols1 %}
+            <option value="{{ c }}">{{ c }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Data Type</label>
+          <select name="datatype___INDEX__" class="datatype-select" required>
+            <option value="">— select type —</option>
+            {% for val, label in datatypes %}
+            <option value="{{ val }}">{{ label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Operator</label>
+          <select name="operator___INDEX__" class="operator-select" required disabled>
+            <option value="">— select operator —</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Column in File 2 (<em>{{ original2 }}</em>)</label>
+          <select name="col2___INDEX__" class="col2-select" required>
+            <option value="">— select column —</option>
+            {% for c in cols2 %}
+            <option value="{{ c }}">{{ c }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <script>
+    const OPERATORS = {{ operators_json | safe }};
+
+    let criterionCount = 0;
+
+    function addCriterion() {
+      const template = document.getElementById('criterionTemplate');
+      const clone = template.content.cloneNode(true);
+      const index = criterionCount++;
+      const row = clone.querySelector('.criterion-row');
+      // Replace __INDEX__ placeholder in all relevant attributes
+      row.dataset.index = index;
+      row.querySelectorAll('[name]').forEach(el => {
+        el.name = el.name.replace('__INDEX__', index);
+      });
+      row.querySelector('.criterion-num').textContent = document.querySelectorAll('.criterion-row').length + 1;
+
+      // Datatype → operator cascade
+      const datatypeSelect = row.querySelector('.datatype-select');
+      const operatorSelect = row.querySelector('.operator-select');
+      datatypeSelect.addEventListener('change', () => {
+        const ops = OPERATORS[datatypeSelect.value] || [];
+        operatorSelect.innerHTML = '<option value="">— select operator —</option>';
+        ops.forEach(([val, label]) => {
+          const opt = document.createElement('option');
+          opt.value = val;
+          opt.textContent = label;
+          operatorSelect.appendChild(opt);
+        });
+        operatorSelect.disabled = ops.length === 0;
+      });
+
+      // Remove button
+      row.querySelector('.btn-remove').addEventListener('click', () => {
+        row.remove();
+        renumberCriteria();
+      });
+
+      document.getElementById('criteria-container').appendChild(clone);
+    }
+
+    function renumberCriteria() {
+      document.querySelectorAll('.criterion-row').forEach((row, i) => {
+        row.querySelector('.criterion-num').textContent = i + 1;
+      });
+    }
+
+    document.getElementById('addCriteria').addEventListener('click', addCriterion);
+
+    // Add one criterion by default
+    addCriterion();
+  </script>
+</body>
+</html>

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Excel Comparator</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>📊 Excel File Comparator</h1>
+      <p class="subtitle">Upload two Excel files, define comparison criteria, and download the results.</p>
+    </header>
+
+    {% if errors %}
+    <div class="alert alert-error">
+      <ul>
+        {% for e in errors %}<li>{{ e }}</li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
+      <div class="form-row">
+        <div class="form-group">
+          <label for="file1">📄 First Excel File</label>
+          <input type="file" id="file1" name="file1" accept=".xlsx,.xls" required />
+          <small>Rows that do not match will come from this file.</small>
+        </div>
+        <div class="form-group">
+          <label for="file2">📄 Second Excel File</label>
+          <input type="file" id="file2" name="file2" accept=".xlsx,.xls" required />
+          <small>Matched rows will come from this file.</small>
+        </div>
+      </div>
+      <button type="submit" class="btn btn-primary">Upload &amp; Configure →</button>
+    </form>
+
+    <section class="how-it-works">
+      <h2>How It Works</h2>
+      <ol>
+        <li>Upload your two Excel files above.</li>
+        <li>Select which column in File&nbsp;1 maps to which column in File&nbsp;2 for each comparison.</li>
+        <li>Choose the data type and comparison operator for each criterion.</li>
+        <li>Add as many comparison criteria as needed.</li>
+        <li>Click <strong>Compare</strong> to download a ZIP containing:<br/>
+            &nbsp;&nbsp;• <code>matched.xlsx</code> – rows from File&nbsp;2 that matched File&nbsp;1<br/>
+            &nbsp;&nbsp;• <code>unmatched.xlsx</code> – rows from File&nbsp;1 with no match in File&nbsp;2
+        </li>
+      </ol>
+    </section>
+  </div>
+</body>
+</html>
