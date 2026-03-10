@@ -9,6 +9,7 @@ Upload two Excel files, configure column-level comparison criteria
 import io
 import json
 import os
+import re
 import shutil
 import uuid
 import zipfile
@@ -76,8 +77,13 @@ DATATYPES = [
     ("boolean", "Boolean (True / False)"),
 ]
 
-DEFAULT_SAMPLE_FILE1 = "sample_file1.xlsx"
-DEFAULT_SAMPLE_FILE2 = "sample_file2.xlsx"
+DEFAULT_SAMPLE_FILE1 = "Order.xlsx"
+DEFAULT_SAMPLE_FILE2 = "Saanch - Copy.xlsx"
+DEFAULT_SAMPLE_COMPARISON_FILES = [
+    "Saanch - Copy.xlsx",
+    "GPVDS - Copy.xlsx",
+    "Vertex - Copy.xlsx",
+]
 MAX_UPLOAD_FILES = 8
 
 
@@ -128,11 +134,23 @@ def apply_operator(left: pd.Series, right_scalar, operator: str) -> pd.Series:
     if operator == "lte":
         return left <= right_scalar
     if operator == "contains":
-        return left.str.contains(str(right_scalar), na=False, case=False)
+        needle = str(right_scalar).strip()
+        if not needle:
+            return pd.Series([False] * len(left), index=left.index)
+        # Match as a phrase boundary to avoid accidental matches inside words
+        # (e.g., "pen" should not match "open box").
+        pattern = rf"(?<![0-9A-Za-z]){re.escape(needle)}(?![0-9A-Za-z])"
+        return left.fillna("").astype(str).str.contains(pattern, na=False, case=False, regex=True)
     if operator == "startswith":
-        return left.str.startswith(str(right_scalar))
+        needle = str(right_scalar).strip()
+        if not needle:
+            return pd.Series([False] * len(left), index=left.index)
+        return left.fillna("").astype(str).str.startswith(needle)
     if operator == "endswith":
-        return left.str.endswith(str(right_scalar))
+        needle = str(right_scalar).strip()
+        if not needle:
+            return pd.Series([False] * len(left), index=left.index)
+        return left.fillna("").astype(str).str.endswith(needle)
     raise ValueError(f"Unknown operator: {operator}")
 
 
@@ -259,7 +277,7 @@ def compare_dataframes(
     unmatched_df1_indices = [i for i in df1.index if i not in matched_df1_indices]
 
     matched = df2.loc[sorted(matched_df2_indices)].reset_index(drop=True)
-    unmatched = df1.loc[unmatched_df1_indices].reset_index(drop=True)
+    unmatched = df1.loc[unmatched_df1_indices].copy()
 
     return matched, unmatched
 
@@ -270,40 +288,46 @@ def compare_dataframes(
 
 
 def load_default_samples_into_session() -> bool:
-    """Load sample_file1.xlsx and sample_file2.xlsx into session context.
+    """Load bundled sample files into session context.
 
-    Returns True when both sample files are available and readable.
+    Returns True when all required sample files are available and readable.
     """
     sample_dir = os.path.join(os.path.dirname(__file__), "sample_data")
-    sample1_name = DEFAULT_SAMPLE_FILE1
-    sample2_name = DEFAULT_SAMPLE_FILE2
-    source1 = os.path.join(sample_dir, sample1_name)
-    source2 = os.path.join(sample_dir, sample2_name)
+    source1 = os.path.join(sample_dir, DEFAULT_SAMPLE_FILE1)
+    comparison_sources = [
+        os.path.join(sample_dir, sample_name)
+        for sample_name in DEFAULT_SAMPLE_COMPARISON_FILES
+    ]
 
-    if not (os.path.exists(source1) and os.path.exists(source2)):
+    if not os.path.exists(source1):
+        return False
+    if any(not os.path.exists(path) for path in comparison_sources):
         return False
 
     # Copy into uploads so downstream compare flow can use the same code path.
     dest1_name = "default_sample_file1.xlsx"
-    dest2_name = "default_sample_file2.xlsx"
     dest1 = os.path.join(UPLOAD_FOLDER, dest1_name)
-    dest2 = os.path.join(UPLOAD_FOLDER, dest2_name)
     shutil.copyfile(source1, dest1)
-    shutil.copyfile(source2, dest2)
+
+    copied_comparisons = []
+    for idx, sample_name in enumerate(DEFAULT_SAMPLE_COMPARISON_FILES, start=2):
+        source_path = os.path.join(sample_dir, sample_name)
+        dest_name = f"default_sample_file{idx}.xlsx"
+        dest_path = os.path.join(UPLOAD_FOLDER, dest_name)
+        shutil.copyfile(source_path, dest_path)
+        copied_comparisons.append({"stored": dest_name, "original": sample_name})
 
     try:
         df1 = read_excel(dest1)
-        df2 = read_excel(dest2)
+        df2 = read_excel(os.path.join(UPLOAD_FOLDER, copied_comparisons[0]["stored"]))
     except Exception:  # noqa: BLE001
         return False
 
     session["file1"] = dest1_name
-    session["file2"] = dest2_name
-    session["comparison_files"] = [
-        {"stored": dest2_name, "original": sample2_name}
-    ]
-    session["original1"] = sample1_name
-    session["original2"] = sample2_name
+    session["file2"] = copied_comparisons[0]["stored"]
+    session["comparison_files"] = copied_comparisons
+    session["original1"] = DEFAULT_SAMPLE_FILE1
+    session["original2"] = copied_comparisons[0]["original"]
     session["cols1"] = list(df1.columns)
     session["cols2"] = list(df2.columns)
     return True
@@ -343,6 +367,7 @@ def order_creator():
         "index.html",
         default_file1=f"sample_data/{DEFAULT_SAMPLE_FILE1}",
         default_file2=f"sample_data/{DEFAULT_SAMPLE_FILE2}",
+        default_comparison_files=DEFAULT_SAMPLE_COMPARISON_FILES,
         max_upload_files=MAX_UPLOAD_FILES,
     )
 
@@ -365,6 +390,22 @@ def upload():
     file1_missing = (not file1) or file1.filename == ""
     provided_comparison_uploads = [f for f in comparison_uploads if f and f.filename != ""]
     comparisons_missing = len(provided_comparison_uploads) == 0
+    use_sample_set = request.form.get("use_sample_set") == "1"
+
+    if use_sample_set:
+        if load_default_samples_into_session():
+            return redirect(url_for("configure"))
+        return render_template(
+            "index.html",
+            errors=[
+                "Bundled sample files are not available. "
+                "Please add Order.xlsx, Saanch - Copy.xlsx, GPVDS - Copy.xlsx, and Vertex - Copy.xlsx under sample_data/."
+            ],
+            default_file1=f"sample_data/{DEFAULT_SAMPLE_FILE1}",
+            default_file2=f"sample_data/{DEFAULT_SAMPLE_FILE2}",
+            default_comparison_files=DEFAULT_SAMPLE_COMPARISON_FILES,
+            max_upload_files=MAX_UPLOAD_FILES,
+        )
 
     # If user submits without selecting files, fall back to bundled defaults.
     if not app.config.get("TESTING") and file1_missing and comparisons_missing:
@@ -375,6 +416,7 @@ def upload():
             errors=["Default sample files are not available."],
             default_file1=f"sample_data/{DEFAULT_SAMPLE_FILE1}",
             default_file2=f"sample_data/{DEFAULT_SAMPLE_FILE2}",
+            default_comparison_files=DEFAULT_SAMPLE_COMPARISON_FILES,
             max_upload_files=MAX_UPLOAD_FILES,
         )
 
@@ -397,6 +439,7 @@ def upload():
             errors=errors,
             default_file1=f"sample_data/{DEFAULT_SAMPLE_FILE1}",
             default_file2=f"sample_data/{DEFAULT_SAMPLE_FILE2}",
+            default_comparison_files=DEFAULT_SAMPLE_COMPARISON_FILES,
             max_upload_files=MAX_UPLOAD_FILES,
         )
 
@@ -420,6 +463,7 @@ def upload():
             errors=[f"Could not read Excel file: {exc}"],
             default_file1=f"sample_data/{DEFAULT_SAMPLE_FILE1}",
             default_file2=f"sample_data/{DEFAULT_SAMPLE_FILE2}",
+            default_comparison_files=DEFAULT_SAMPLE_COMPARISON_FILES,
             max_upload_files=MAX_UPLOAD_FILES,
         )
 
@@ -563,7 +607,7 @@ def compare():
 
     try:
         unmatched_working = df1.copy()
-        matched_chunks = []
+        per_step_results = []
 
         for entry in comparison_entries:
             if unmatched_working.empty:
@@ -601,16 +645,35 @@ def compare():
                     ],
                 )
 
-            matched, unmatched_working = compare_dataframes(unmatched_working, df_compare, criteria)
-            if not matched.empty:
-                matched_chunks.append(matched)
+            current_unmatched_input = unmatched_working.copy()
+            _matched_df2, next_unmatched = compare_dataframes(
+                current_unmatched_input,
+                df_compare,
+                criteria,
+            )
 
-        if matched_chunks:
-            matched = pd.concat(matched_chunks, ignore_index=True)
+            # Matched output should contain order-side rows (File 1 perspective)
+            # that matched in this specific comparison step.
+            matched_order_rows = current_unmatched_input.loc[
+                ~current_unmatched_input.index.isin(next_unmatched.index)
+            ]
+            per_step_results.append(
+                {
+                    "step": len(per_step_results) + 1,
+                    "comparison_name": entry["original"],
+                    "matched": matched_order_rows.reset_index(drop=True),
+                    "unmatched": next_unmatched.reset_index(drop=True),
+                }
+            )
+
+            unmatched_working = next_unmatched
+
+        if per_step_results:
+            matched = per_step_results[-1]["matched"]
+            unmatched = per_step_results[-1]["unmatched"]
         else:
-            first_compare_df = read_excel(os.path.join(UPLOAD_FOLDER, comparison_entries[0]["stored"]))
-            matched = pd.DataFrame(columns=first_compare_df.columns)
-        unmatched = unmatched_working
+            matched = pd.DataFrame(columns=df1.columns)
+            unmatched = df1.copy()
     except Exception as exc:  # noqa: BLE001
         return render_template(
             "configure.html",
@@ -626,8 +689,52 @@ def compare():
 
     # Write both result DataFrames into an in-memory ZIP file
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    def _step_file_label(step_number: int, comparison_name: str) -> str:
+        base = os.path.basename(comparison_name)
+        root, _ext = os.path.splitext(base)
+        safe_root = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in root)
+        safe_root = safe_root.strip("_") or f"file{step_number + 1}"
+        return f"step{step_number}_{safe_root}"
+
+    def _safe_file_root(filename: str, fallback: str) -> str:
+        base = os.path.basename(filename)
+        root, _ext = os.path.splitext(base)
+        safe_root = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in root)
+        return safe_root.strip("_") or fallback
+
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        used_names = set()
+
+        def unique_name(filename: str) -> str:
+            if filename not in used_names:
+                used_names.add(filename)
+                return filename
+
+            root, ext = os.path.splitext(filename)
+            counter = 2
+            while True:
+                candidate = f"{root}_{counter}{ext}"
+                if candidate not in used_names:
+                    used_names.add(candidate)
+                    return candidate
+                counter += 1
+
+        # Step-wise outputs for each pairwise comparison.
+        for step_result in per_step_results:
+            label = _step_file_label(step_result["step"], step_result["comparison_name"])
+            safe_root = _safe_file_root(step_result["comparison_name"], f"file{step_result['step'] + 1}")
+            for df, name in [
+                (step_result["matched"], f"{safe_root}_Order.xlsx"),
+                (step_result["unmatched"], f"unmatched_{label}_{timestamp}.xlsx"),
+            ]:
+                excel_buffer = io.BytesIO()
+                with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                    df.to_excel(writer, index=False)
+                zf.writestr(unique_name(name), excel_buffer.getvalue())
+
+        # Backward-compatible aliases: final step result.
         for df, name in [
             (matched, f"matched_{timestamp}.xlsx"),
             (unmatched, f"unmatched_{timestamp}.xlsx"),
@@ -635,7 +742,7 @@ def compare():
             excel_buffer = io.BytesIO()
             with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
                 df.to_excel(writer, index=False)
-            zf.writestr(name, excel_buffer.getvalue())
+            zf.writestr(unique_name(name), excel_buffer.getvalue())
 
     zip_buffer.seek(0)
     return send_file(

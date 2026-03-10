@@ -25,26 +25,34 @@
     <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
       <div class="alert">
         <p>
-          Default files on submit (if you do not choose files manually):
-          <strong>{{ default_file1 or 'sample_data/sample_file1.xlsx' }}</strong> and
-          <strong>{{ default_file2 or 'sample_data/sample_file2.xlsx' }}</strong>
+          Bundled sample set available in solution:
+          <strong>{{ default_file1 or 'sample_data/Order.xlsx' }}</strong>,
+          {% for sample_file in (default_comparison_files or []) %}
+          <strong>sample_data/{{ sample_file }}</strong>{% if not loop.last %}, {% endif %}
+          {% endfor %}
         </p>
         <p>
           Download defaults:
           <a href="/download-input/1">File 1</a> |
           <a href="/download-input/2">File 2</a>
         </p>
+        <p>
+          <label>
+            <input type="checkbox" name="use_sample_set" value="1" />
+            Use bundled sample files directly from solution
+          </label>
+        </p>
       </div>
       <div class="form-row">
         <div class="form-group">
           <label for="file1">📄 File 1 (Order Excel)</label>
           <input type="file" id="file1" name="file1" accept=".xlsx,.xls" />
-          <small>Leave empty to use {{ default_file1 or 'sample_data/sample_file1.xlsx' }}.</small>
+          <small>Leave empty if you enable the bundled sample option above.</small>
         </div>
         <div class="form-group">
           <label for="file2">📄 File 2 (Comparison Excel)</label>
           <input type="file" id="file2" name="file2" accept=".xlsx,.xls" />
-          <small>Leave empty to use {{ default_file2 or 'sample_data/sample_file2.xlsx' }}.</small>
+          <small>Leave empty if you enable the bundled sample option above.</small>
         </div>
       </div>
 

@@ -103,6 +103,12 @@ def test_apply_operator_contains():
     assert list(mask) == [True, False, True]
 
 
+def test_apply_operator_contains_no_partial_word_match():
+    s = pd.Series(["Open Box", "Blue Pen", "Pencil"])
+    mask = apply_operator(s, "pen", "contains")
+    assert list(mask) == [False, True, False]
+
+
 def test_apply_operator_startswith():
     s = pd.Series(["hello world", "foo bar"])
     mask = apply_operator(s, "hello", "startswith")
@@ -346,14 +352,59 @@ def test_full_compare_flow(client):
     assert any("matched" in n for n in names)
     assert any("unmatched" in n for n in names)
 
-    matched_bytes = zf.read(next(n for n in names if "matched" in n))
-    unmatched_bytes = zf.read(next(n for n in names if "unmatched" in n))
+    matched_bytes = zf.read(next(n for n in names if n.startswith("matched_")))
+    unmatched_bytes = zf.read(next(n for n in names if n.startswith("unmatched_")))
 
     matched_df = pd.read_excel(io.BytesIO(matched_bytes))
     unmatched_df = pd.read_excel(io.BytesIO(unmatched_bytes))
 
-    assert set(matched_df["FullName"]) == {"Alice", "Bob"}
+    assert set(matched_df["Name"]) == {"Alice", "Bob"}
     assert list(unmatched_df["Name"]) == ["Dave"]
+
+
+def test_compare_generates_stepwise_outputs_for_multiple_files(client):
+    """When multiple comparison files are uploaded, ZIP should include per-step outputs."""
+    excel1 = _make_excel_bytes({"Name": ["Alice", "Bob", "Dave"]})
+    excel2 = _make_excel_bytes({"FullName": ["Alice"]})
+    excel3 = _make_excel_bytes({"FullName": ["Bob"]})
+
+    upload_resp = client.post(
+        "/upload",
+        data={
+            "file1": (io.BytesIO(excel1), "orders.xlsx"),
+            "file2": (io.BytesIO(excel2), "compare_2.xlsx"),
+            "file3": (io.BytesIO(excel3), "compare_3.xlsx"),
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert upload_resp.status_code == 200
+
+    compare_resp = client.post(
+        "/compare",
+        data={
+            "col1_0": "Name",
+            "col2_0": "FullName",
+            "datatype_0": "string",
+            "operator_0": "eq",
+        },
+        follow_redirects=True,
+    )
+    assert compare_resp.status_code == 200
+    assert compare_resp.content_type == "application/zip"
+
+    zf = zipfile.ZipFile(io.BytesIO(compare_resp.data))
+    names = zf.namelist()
+
+    # Step files for both comparison files should exist.
+    assert any(n == "compare_2_Order.xlsx" for n in names)
+    assert any("unmatched_step1_compare_2" in n for n in names)
+    assert any(n == "compare_3_Order.xlsx" for n in names)
+    assert any("unmatched_step2_compare_3" in n for n in names)
+
+    # Final aliases should still exist.
+    assert any(n.startswith("matched_") and "step" not in n for n in names)
+    assert any(n.startswith("unmatched_") and "step" not in n for n in names)
 
 
 def test_download_input_file_after_upload(client):
