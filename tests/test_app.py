@@ -6,7 +6,15 @@ import zipfile
 import pandas as pd
 import pytest
 
-from app import app, cast_series, apply_operator, compare_dataframes, OPERATORS, DATATYPES
+from app import (
+    app,
+    cast_series,
+    apply_operator,
+    apply_scalar_operator,
+    compare_dataframes,
+    OPERATORS,
+    DATATYPES,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +121,11 @@ def test_apply_operator_unknown_raises():
         apply_operator(s, "a", "not_an_operator")
 
 
+def test_apply_scalar_operator_eq():
+    assert apply_scalar_operator(10, 10, "eq") is True
+    assert apply_scalar_operator(10, 12, "eq") is False
+
+
 # ---------------------------------------------------------------------------
 # Unit tests – compare_dataframes
 # ---------------------------------------------------------------------------
@@ -153,23 +166,72 @@ def test_compare_number_gte():
     df2 = _make_df({"Points": [3, 5, 8]})
     criteria = [{"col1": "Score", "col2": "Points", "datatype": "number", "operator": "gte"}]
     matched, unmatched = compare_dataframes(df1, df2, criteria)
-    # df2 rows where Points >= 5 (the value from df1)
-    assert set(matched["Points"]) == {"5", "8"}
+    # Numeric semantics are File1 OP File2: Score >= Points.
+    assert set(matched["Points"]) == {"3", "5"}
     assert unmatched.empty  # df1 row matched
 
 
 def test_compare_multiple_criteria():
-    df1 = pd.DataFrame({"Name": ["Alice"], "Age": ["30"]})
+    df1 = pd.DataFrame({"Name": ["Alice"], "Age": ["55"]})
     df2 = pd.DataFrame({"FullName": ["Alice", "Alice", "Bob"], "Years": ["30", "25", "30"]})
     criteria = [
         {"col1": "Name", "col2": "FullName", "datatype": "string", "operator": "eq"},
         {"col1": "Age", "col2": "Years", "datatype": "number", "operator": "eq"},
     ]
     matched, unmatched = compare_dataframes(df1, df2, criteria)
-    assert len(matched) == 1
-    assert matched.iloc[0]["FullName"] == "Alice"
-    assert matched.iloc[0]["Years"] == "30"
+    # Number criterion is evaluated against SUM(Years) of rows matching Name=Alice.
+    assert len(matched) == 2
+    assert set(matched["FullName"]) == {"Alice"}
+    assert set(matched["Years"]) == {"30", "25"}
     assert unmatched.empty
+
+
+def test_compare_number_sum_with_other_criteria_no_match():
+    df1 = pd.DataFrame({"Product": ["Mouse"], "Warehouse": ["Delhi"], "ExpectedQty": ["100"]})
+    df2 = pd.DataFrame(
+        {
+            "Item": ["Mouse Black", "Mouse White", "Mouse Wireless"],
+            "Location": ["Delhi", "Delhi", "Delhi"],
+            "Qty": ["40", "50", "15"],
+        }
+    )
+    criteria = [
+        {"col1": "Product", "col2": "Item", "datatype": "string", "operator": "contains"},
+        {"col1": "Warehouse", "col2": "Location", "datatype": "string", "operator": "eq"},
+        {"col1": "ExpectedQty", "col2": "Qty", "datatype": "number", "operator": "eq"},
+    ]
+    matched, unmatched = compare_dataframes(df1, df2, criteria)
+    assert matched.empty
+    assert list(unmatched["Product"]) == ["Mouse"]
+
+
+def test_compare_number_sum_lte_direction_regression():
+    """Regression: ExpectedQty <= SUM(StockQty) should not match 80 <= 75."""
+    df1 = pd.DataFrame(
+        {
+            "ProductName": ["USB Keyboard"],
+            "Category": ["Accessories"],
+            "Warehouse": ["Delhi"],
+            "ExpectedQty": ["80"],
+        }
+    )
+    df2 = pd.DataFrame(
+        {
+            "ItemName": ["USB Keyboard Basic", "USB Keyboard Pro"],
+            "CategoryType": ["Accessories", "Accessories"],
+            "Location": ["Delhi", "Delhi"],
+            "StockQty": ["30", "45"],
+        }
+    )
+    criteria = [
+        {"col1": "ProductName", "col2": "ItemName", "datatype": "string", "operator": "contains"},
+        {"col1": "Category", "col2": "CategoryType", "datatype": "string", "operator": "eq"},
+        {"col1": "Warehouse", "col2": "Location", "datatype": "string", "operator": "eq"},
+        {"col1": "ExpectedQty", "col2": "StockQty", "datatype": "number", "operator": "lte"},
+    ]
+    matched, unmatched = compare_dataframes(df1, df2, criteria)
+    assert matched.empty
+    assert list(unmatched["ProductName"]) == ["USB Keyboard"]
 
 
 def test_compare_no_match():
@@ -210,7 +272,21 @@ def _make_excel_bytes(data: dict) -> bytes:
 def test_index_get(client):
     resp = client.get("/")
     assert resp.status_code == 200
+    assert b"Operations Hub" in resp.data
+    assert b"Order Creator" in resp.data
+    assert b"Stock Checker" in resp.data
+
+
+def test_order_creator_page_get(client):
+    resp = client.get("/order-creator")
+    assert resp.status_code == 200
     assert b"Excel File Comparator" in resp.data
+
+
+def test_stock_checker_page_get(client):
+    resp = client.get("/stock-checker")
+    assert resp.status_code == 200
+    assert b"Stock Checker" in resp.data
 
 
 def test_upload_missing_files(client):
@@ -278,6 +354,24 @@ def test_full_compare_flow(client):
 
     assert set(matched_df["FullName"]) == {"Alice", "Bob"}
     assert list(unmatched_df["Name"]) == ["Dave"]
+
+
+def test_download_input_file_after_upload(client):
+    excel1 = _make_excel_bytes({"Name": ["Alice"]})
+    excel2 = _make_excel_bytes({"FullName": ["Alice"]})
+
+    client.post(
+        "/upload",
+        data={
+            "file1": (io.BytesIO(excel1), "file1.xlsx"),
+            "file2": (io.BytesIO(excel2), "file2.xlsx"),
+        },
+        content_type="multipart/form-data",
+    )
+
+    resp = client.get("/download-input/1")
+    assert resp.status_code == 200
+    assert "attachment" in resp.headers.get("Content-Disposition", "")
 
 
 def test_compare_no_criteria_shows_error(client):

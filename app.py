@@ -9,6 +9,7 @@ Upload two Excel files, configure column-level comparison criteria
 import io
 import json
 import os
+import shutil
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -75,6 +76,10 @@ DATATYPES = [
     ("boolean", "Boolean (True / False)"),
 ]
 
+DEFAULT_SAMPLE_FILE1 = "sample_file1.xlsx"
+DEFAULT_SAMPLE_FILE2 = "sample_file2.xlsx"
+MAX_UPLOAD_FILES = 8
+
 
 def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -131,6 +136,37 @@ def apply_operator(left: pd.Series, right_scalar, operator: str) -> pd.Series:
     raise ValueError(f"Unknown operator: {operator}")
 
 
+def apply_scalar_operator(left_scalar, right_scalar, operator: str) -> bool:
+    """Apply numeric comparison operators to scalar values."""
+    if operator == "eq":
+        return left_scalar == right_scalar
+    if operator == "ne":
+        return left_scalar != right_scalar
+    if operator == "gt":
+        return left_scalar > right_scalar
+    if operator == "gte":
+        return left_scalar >= right_scalar
+    if operator == "lt":
+        return left_scalar < right_scalar
+    if operator == "lte":
+        return left_scalar <= right_scalar
+    raise ValueError(f"Unsupported scalar operator: {operator}")
+
+
+def reverse_order_operator(operator: str) -> str:
+    """Return equivalent operator when operands are swapped.
+
+    Example: a > b  <=>  b < a
+    """
+    mapping = {
+        "gt": "lt",
+        "gte": "lte",
+        "lt": "gt",
+        "lte": "gte",
+    }
+    return mapping.get(operator, operator)
+
+
 def compare_dataframes(
     df1: pd.DataFrame,
     df2: pd.DataFrame,
@@ -164,11 +200,55 @@ def compare_dataframes(
     matched_df2_indices = set()
     matched_df1_indices = set()
 
+    non_number_criteria = [c for c in criteria if c["datatype"] != "number"]
+    number_criteria = [c for c in criteria if c["datatype"] == "number"]
+
     for i1, row1 in df1_cast.iterrows():
-        # Build a combined boolean mask for df2 rows that match row1 on ALL criteria
+        # If number criteria are present with other criteria, sum matching number
+        # values in df2 and compare total against df1 numeric value.
+        if number_criteria and non_number_criteria:
+            base_mask = pd.Series([True] * len(df2_cast), index=df2_cast.index)
+            for crit in non_number_criteria:
+                col1, col2, operator = crit["col1"], crit["col2"], crit["operator"]
+                row_mask = apply_operator(df2_cast[col2], row1[col1], operator)
+                base_mask = base_mask & row_mask
+
+            if not base_mask.any():
+                continue
+
+            numeric_match = True
+            for crit in number_criteria:
+                col1, col2, operator = crit["col1"], crit["col2"], crit["operator"]
+                total_value = pd.to_numeric(
+                    df2_cast.loc[base_mask, col2], errors="coerce"
+                ).sum(min_count=1)
+                target_value = row1[col1]
+
+                if pd.isna(total_value) or pd.isna(target_value):
+                    numeric_match = False
+                    break
+
+                if not apply_scalar_operator(target_value, total_value, operator):
+                    numeric_match = False
+                    break
+
+            if numeric_match:
+                matched_df1_indices.add(i1)
+                matched_df2_indices.update(df2_cast.index[base_mask].tolist())
+            continue
+
+        # Default behavior: row-wise criteria match.
         mask = pd.Series([True] * len(df2_cast), index=df2_cast.index)
         for crit in criteria:
-            col1, col2, operator = crit["col1"], crit["col2"], crit["operator"]
+            col1, col2 = crit["col1"], crit["col2"]
+            operator = crit["operator"]
+            datatype = crit["datatype"]
+
+            # apply_operator evaluates series OP scalar as (df2 OP df1).
+            # For numeric comparisons, users expect (df1 OP df2), so reverse.
+            if datatype == "number":
+                operator = reverse_order_operator(operator)
+
             row_mask = apply_operator(df2_cast[col2], row1[col1], operator)
             mask = mask & row_mask
 
@@ -189,48 +269,165 @@ def compare_dataframes(
 # ---------------------------------------------------------------------------
 
 
+def load_default_samples_into_session() -> bool:
+    """Load sample_file1.xlsx and sample_file2.xlsx into session context.
+
+    Returns True when both sample files are available and readable.
+    """
+    sample_dir = os.path.join(os.path.dirname(__file__), "sample_data")
+    sample1_name = DEFAULT_SAMPLE_FILE1
+    sample2_name = DEFAULT_SAMPLE_FILE2
+    source1 = os.path.join(sample_dir, sample1_name)
+    source2 = os.path.join(sample_dir, sample2_name)
+
+    if not (os.path.exists(source1) and os.path.exists(source2)):
+        return False
+
+    # Copy into uploads so downstream compare flow can use the same code path.
+    dest1_name = "default_sample_file1.xlsx"
+    dest2_name = "default_sample_file2.xlsx"
+    dest1 = os.path.join(UPLOAD_FOLDER, dest1_name)
+    dest2 = os.path.join(UPLOAD_FOLDER, dest2_name)
+    shutil.copyfile(source1, dest1)
+    shutil.copyfile(source2, dest2)
+
+    try:
+        df1 = read_excel(dest1)
+        df2 = read_excel(dest2)
+    except Exception:  # noqa: BLE001
+        return False
+
+    session["file1"] = dest1_name
+    session["file2"] = dest2_name
+    session["comparison_files"] = [
+        {"stored": dest2_name, "original": sample2_name}
+    ]
+    session["original1"] = sample1_name
+    session["original2"] = sample2_name
+    session["cols1"] = list(df1.columns)
+    session["cols2"] = list(df2.columns)
+    return True
+
+
+def get_comparison_file_entries() -> list[dict[str, str]]:
+    """Return comparison file metadata from session.
+
+    New format uses session["comparison_files"] as a list of
+    {"stored": ..., "original": ...}. Older sessions with only file2/original2
+    are still supported for backward compatibility.
+    """
+    entries = session.get("comparison_files") or []
+    if entries:
+        return entries
+
+    legacy_file2 = session.get("file2")
+    if not legacy_file2:
+        return []
+
+    return [
+        {
+            "stored": legacy_file2,
+            "original": session.get("original2", "File 2"),
+        }
+    ]
+
+
 @app.route("/", methods=["GET"])
-def index():
-    return render_template("index.html")
+def home():
+    return render_template("home.html")
+
+
+@app.route("/order-creator", methods=["GET"])
+def order_creator():
+    return render_template(
+        "index.html",
+        default_file1=f"sample_data/{DEFAULT_SAMPLE_FILE1}",
+        default_file2=f"sample_data/{DEFAULT_SAMPLE_FILE2}",
+        max_upload_files=MAX_UPLOAD_FILES,
+    )
+
+
+@app.route("/stock-checker", methods=["GET"])
+def stock_checker():
+    return render_template("stock_checker.html")
 
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    """Accept two Excel files, store them, forward to configure page."""
+    """Accept an order file plus up to 7 comparison files.
+
+    File 1 is the base order file. Files 2..8 are optional comparison files
+    that will be used sequentially in /compare.
+    """
     file1 = request.files.get("file1")
-    file2 = request.files.get("file2")
+    comparison_uploads = [request.files.get(f"file{i}") for i in range(2, MAX_UPLOAD_FILES + 1)]
+
+    file1_missing = (not file1) or file1.filename == ""
+    provided_comparison_uploads = [f for f in comparison_uploads if f and f.filename != ""]
+    comparisons_missing = len(provided_comparison_uploads) == 0
+
+    # If user submits without selecting files, fall back to bundled defaults.
+    if not app.config.get("TESTING") and file1_missing and comparisons_missing:
+        if load_default_samples_into_session():
+            return redirect(url_for("configure"))
+        return render_template(
+            "index.html",
+            errors=["Default sample files are not available."],
+            default_file1=f"sample_data/{DEFAULT_SAMPLE_FILE1}",
+            default_file2=f"sample_data/{DEFAULT_SAMPLE_FILE2}",
+            max_upload_files=MAX_UPLOAD_FILES,
+        )
 
     errors = []
-    if not file1 or file1.filename == "":
-        errors.append("Please select the first Excel file.")
+    if file1_missing:
+        errors.append("Please select the order Excel file (File 1).")
     elif not allowed_file(file1.filename):
         errors.append("File 1 must be an Excel file (.xlsx or .xls).")
 
-    if not file2 or file2.filename == "":
-        errors.append("Please select the second Excel file.")
-    elif not allowed_file(file2.filename):
-        errors.append("File 2 must be an Excel file (.xlsx or .xls).")
+    if comparisons_missing:
+        errors.append("Please select at least one comparison Excel file (File 2 to File 8).")
+
+    for index, comp_file in enumerate(comparison_uploads, start=2):
+        if comp_file and comp_file.filename and not allowed_file(comp_file.filename):
+            errors.append(f"File {index} must be an Excel file (.xlsx or .xls).")
 
     if errors:
-        return render_template("index.html", errors=errors)
+        return render_template(
+            "index.html",
+            errors=errors,
+            default_file1=f"sample_data/{DEFAULT_SAMPLE_FILE1}",
+            default_file2=f"sample_data/{DEFAULT_SAMPLE_FILE2}",
+            max_upload_files=MAX_UPLOAD_FILES,
+        )
 
     fname1 = safe_filename(file1.filename)
-    fname2 = safe_filename(file2.filename)
     path1 = os.path.join(UPLOAD_FOLDER, fname1)
-    path2 = os.path.join(UPLOAD_FOLDER, fname2)
     file1.save(path1)
-    file2.save(path2)
+
+    saved_comparison_entries = []
+    for comp_file in provided_comparison_uploads:
+        comp_name = safe_filename(comp_file.filename)
+        comp_path = os.path.join(UPLOAD_FOLDER, comp_name)
+        comp_file.save(comp_path)
+        saved_comparison_entries.append({"stored": comp_name, "original": comp_file.filename})
 
     try:
         df1 = read_excel(path1)
-        df2 = read_excel(path2)
+        df2 = read_excel(os.path.join(UPLOAD_FOLDER, saved_comparison_entries[0]["stored"]))
     except Exception as exc:  # noqa: BLE001
-        return render_template("index.html", errors=[f"Could not read Excel file: {exc}"])
+        return render_template(
+            "index.html",
+            errors=[f"Could not read Excel file: {exc}"],
+            default_file1=f"sample_data/{DEFAULT_SAMPLE_FILE1}",
+            default_file2=f"sample_data/{DEFAULT_SAMPLE_FILE2}",
+            max_upload_files=MAX_UPLOAD_FILES,
+        )
 
     session["file1"] = fname1
-    session["file2"] = fname2
+    session["file2"] = saved_comparison_entries[0]["stored"]
+    session["comparison_files"] = saved_comparison_entries
     session["original1"] = file1.filename
-    session["original2"] = file2.filename
+    session["original2"] = saved_comparison_entries[0]["original"]
     session["cols1"] = list(df1.columns)
     session["cols2"] = list(df2.columns)
 
@@ -242,7 +439,7 @@ def configure():
     cols1 = session.get("cols1", [])
     cols2 = session.get("cols2", [])
     if not cols1 or not cols2:
-        return redirect(url_for("index"))
+        return redirect(url_for("order_creator"))
 
     return render_template(
         "configure.html",
@@ -252,6 +449,7 @@ def configure():
         operators_json=json.dumps(OPERATORS),
         original1=session.get("original1", "File 1"),
         original2=session.get("original2", "File 2"),
+        comparison_count=len(get_comparison_file_entries()),
     )
 
 
@@ -263,20 +461,61 @@ def operators_api():
     return jsonify(ops)
 
 
+@app.route("/download-input/<which>", methods=["GET"])
+def download_input(which: str):
+    """Download File 1..8 currently selected for comparison."""
+    if not which.isdigit():
+        return redirect(url_for("home"))
+
+    file_index = int(which)
+    if file_index < 1 or file_index > MAX_UPLOAD_FILES:
+        return redirect(url_for("home"))
+
+    if file_index == 1:
+        stored_name = session.get("file1")
+        original_name = os.path.basename(session.get("original1", DEFAULT_SAMPLE_FILE1))
+        if stored_name:
+            stored_path = os.path.join(UPLOAD_FOLDER, stored_name)
+            if os.path.exists(stored_path):
+                return send_file(stored_path, as_attachment=True, download_name=original_name)
+
+        sample_path = os.path.join(os.path.dirname(__file__), "sample_data", DEFAULT_SAMPLE_FILE1)
+        if os.path.exists(sample_path):
+            return send_file(sample_path, as_attachment=True, download_name=DEFAULT_SAMPLE_FILE1)
+        return redirect(url_for("home"))
+
+    comparison_entries = get_comparison_file_entries()
+    comparison_idx = file_index - 2
+    if comparison_idx < len(comparison_entries):
+        entry = comparison_entries[comparison_idx]
+        stored_path = os.path.join(UPLOAD_FOLDER, entry["stored"])
+        if os.path.exists(stored_path):
+            return send_file(
+                stored_path,
+                as_attachment=True,
+                download_name=os.path.basename(entry["original"]),
+            )
+
+    if file_index == 2:
+        sample_path = os.path.join(os.path.dirname(__file__), "sample_data", DEFAULT_SAMPLE_FILE2)
+        if os.path.exists(sample_path):
+            return send_file(sample_path, as_attachment=True, download_name=DEFAULT_SAMPLE_FILE2)
+
+    return redirect(url_for("home"))
+
+
 @app.route("/compare", methods=["POST"])
 def compare():
     """Run the comparison and return a ZIP file with the two result Excel files."""
     fname1 = session.get("file1")
-    fname2 = session.get("file2")
-    if not fname1 or not fname2:
-        return redirect(url_for("index"))
+    comparison_entries = get_comparison_file_entries()
+    if not fname1 or not comparison_entries:
+        return redirect(url_for("order_creator"))
 
     path1 = os.path.join(UPLOAD_FOLDER, fname1)
-    path2 = os.path.join(UPLOAD_FOLDER, fname2)
 
     try:
         df1 = read_excel(path1)
-        df2 = read_excel(path2)
     except Exception as exc:  # noqa: BLE001
         return render_template(
             "configure.html",
@@ -286,6 +525,7 @@ def compare():
             operators_json=json.dumps(OPERATORS),
             original1=session.get("original1", "File 1"),
             original2=session.get("original2", "File 2"),
+            comparison_count=len(comparison_entries),
             errors=[f"Could not read Excel files: {exc}"],
         )
 
@@ -317,10 +557,72 @@ def compare():
             operators_json=json.dumps(OPERATORS),
             original1=session.get("original1", "File 1"),
             original2=session.get("original2", "File 2"),
+            comparison_count=len(comparison_entries),
             errors=["Please add at least one comparison criterion."],
         )
 
-    matched, unmatched = compare_dataframes(df1, df2, criteria)
+    try:
+        unmatched_working = df1.copy()
+        matched_chunks = []
+
+        for entry in comparison_entries:
+            if unmatched_working.empty:
+                break
+
+            df_compare = read_excel(os.path.join(UPLOAD_FOLDER, entry["stored"]))
+
+            missing_col1 = [c["col1"] for c in criteria if c["col1"] not in unmatched_working.columns]
+            missing_col2 = [c["col2"] for c in criteria if c["col2"] not in df_compare.columns]
+            if missing_col1:
+                return render_template(
+                    "configure.html",
+                    cols1=session.get("cols1", []),
+                    cols2=session.get("cols2", []),
+                    datatypes=DATATYPES,
+                    operators_json=json.dumps(OPERATORS),
+                    original1=session.get("original1", "File 1"),
+                    original2=session.get("original2", "File 2"),
+                    comparison_count=len(comparison_entries),
+                    errors=[f"Missing column(s) in File 1/unmatched data: {', '.join(sorted(set(missing_col1)))}"],
+                )
+            if missing_col2:
+                return render_template(
+                    "configure.html",
+                    cols1=session.get("cols1", []),
+                    cols2=session.get("cols2", []),
+                    datatypes=DATATYPES,
+                    operators_json=json.dumps(OPERATORS),
+                    original1=session.get("original1", "File 1"),
+                    original2=session.get("original2", "File 2"),
+                    comparison_count=len(comparison_entries),
+                    errors=[
+                        f"Missing required comparison column(s) in {entry['original']}: "
+                        f"{', '.join(sorted(set(missing_col2)))}"
+                    ],
+                )
+
+            matched, unmatched_working = compare_dataframes(unmatched_working, df_compare, criteria)
+            if not matched.empty:
+                matched_chunks.append(matched)
+
+        if matched_chunks:
+            matched = pd.concat(matched_chunks, ignore_index=True)
+        else:
+            first_compare_df = read_excel(os.path.join(UPLOAD_FOLDER, comparison_entries[0]["stored"]))
+            matched = pd.DataFrame(columns=first_compare_df.columns)
+        unmatched = unmatched_working
+    except Exception as exc:  # noqa: BLE001
+        return render_template(
+            "configure.html",
+            cols1=session.get("cols1", []),
+            cols2=session.get("cols2", []),
+            datatypes=DATATYPES,
+            operators_json=json.dumps(OPERATORS),
+            original1=session.get("original1", "File 1"),
+            original2=session.get("original2", "File 2"),
+            comparison_count=len(comparison_entries),
+            errors=[f"Could not compare Excel files: {exc}"],
+        )
 
     # Write both result DataFrames into an in-memory ZIP file
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")

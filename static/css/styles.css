@@ -257,3 +257,46 @@ select:disabled {
   padding: .1rem .4rem;
   font-size: .88rem;
 }
+
+/* ── Home Menu ──────────────────────────────────────────────── */
+.menu-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+@media (max-width: 700px) {
+  .menu-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.menu-card {
+  display: block;
+  text-decoration: none;
+  background: #fff;
+  color: inherit;
+  border-radius: 12px;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 2px 6px rgba(0,0,0,.06);
+  padding: 1.25rem;
+  transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
+}
+
+.menu-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 16px rgba(0,0,0,.08);
+  border-color: #63b3ed;
+}
+
+.menu-card h2 {
+  color: #2b6cb0;
+  font-size: 1.1rem;
+  margin-bottom: .45rem;
+}
+
+.menu-card p {
+  color: #4a5568;
+  line-height: 1.6;
+  font-size: .95rem;
+}

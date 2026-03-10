@@ -10,13 +10,15 @@
   <div class="container">
     <header>
       <h1>📊 Excel File Comparator</h1>
-      <p class="subtitle">Configure the column comparisons between your two files.</p>
+      <p class="subtitle">Configure criteria once. It will run from File 2 through all uploaded comparison files ({{ comparison_count or 1 }} file(s)).</p>
     </header>
 
     <div class="file-info">
       <span class="badge">File 1: {{ original1 }}</span>
       <span class="badge">File 2: {{ original2 }}</span>
-      <a href="/" class="link-reset">← Upload different files</a>
+      <a href="/download-input/1" class="link-reset">Download File 1</a>
+      <a href="/download-input/2" class="link-reset">Download File 2</a>
+      <a href="/order-creator" class="link-reset">← Upload different files</a>
     </div>
 
     {% if errors %}
@@ -89,6 +91,15 @@
 
     let criterionCount = 0;
 
+    function setSelectValueIfPresent(selectEl, value) {
+      const option = Array.from(selectEl.options).find(opt => opt.value === value);
+      if (!option) {
+        return false;
+      }
+      selectEl.value = value;
+      return true;
+    }
+
     function addCriterion() {
       const template = document.getElementById('criterionTemplate');
       const clone = template.content.cloneNode(true);
@@ -115,6 +126,19 @@
         });
         operatorSelect.disabled = ops.length === 0;
       });
+
+      // Auto-prefill the first criterion for bundled sample files.
+      if (index === 0) {
+        const col1Select = row.querySelector('.col1-select');
+        const col2Select = row.querySelector('.col2-select');
+        const hasCol1 = setSelectValueIfPresent(col1Select, 'ProductName');
+        const hasCol2 = setSelectValueIfPresent(col2Select, 'ItemName');
+        if (hasCol1 && hasCol2) {
+          setSelectValueIfPresent(datatypeSelect, 'string');
+          datatypeSelect.dispatchEvent(new Event('change'));
+          setSelectValueIfPresent(operatorSelect, 'contains');
+        }
+      }
 
       // Remove button
       row.querySelector('.btn-remove').addEventListener('click', () => {

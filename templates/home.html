@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Home</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Operations Hub</h1>
+      <p class="subtitle">Choose a module to continue.</p>
+    </header>
+
+    <section class="menu-grid">
+      <a class="menu-card" href="/order-creator">
+        <h2>Order Creator</h2>
+        <p>Create and compare order files with configurable criteria.</p>
+      </a>
+      <a class="menu-card" href="/stock-checker">
+        <h2>Stock Checker</h2>
+        <p>Review stock validation workflows and inventory checks.</p>
+      </a>
+    </section>
+  </div>
+</body>
+</html>

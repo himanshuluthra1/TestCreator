@@ -10,7 +10,8 @@
   <div class="container">
     <header>
       <h1>📊 Excel File Comparator</h1>
-      <p class="subtitle">Upload two Excel files, define comparison criteria, and download the results.</p>
+      <p class="subtitle">Upload one order file and up to seven comparison files, then download matched and unmatched results.</p>
+      <p><a href="/" class="link-reset" style="margin-left: 0;">← Back to Home</a></p>
     </header>
 
     {% if errors %}
@@ -22,17 +23,39 @@
     {% endif %}
 
     <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
+      <div class="alert">
+        <p>
+          Default files on submit (if you do not choose files manually):
+          <strong>{{ default_file1 or 'sample_data/sample_file1.xlsx' }}</strong> and
+          <strong>{{ default_file2 or 'sample_data/sample_file2.xlsx' }}</strong>
+        </p>
+        <p>
+          Download defaults:
+          <a href="/download-input/1">File 1</a> |
+          <a href="/download-input/2">File 2</a>
+        </p>
+      </div>
       <div class="form-row">
         <div class="form-group">
-          <label for="file1">📄 First Excel File</label>
-          <input type="file" id="file1" name="file1" accept=".xlsx,.xls" required />
-          <small>Rows that do not match will come from this file.</small>
+          <label for="file1">📄 File 1 (Order Excel)</label>
+          <input type="file" id="file1" name="file1" accept=".xlsx,.xls" />
+          <small>Leave empty to use {{ default_file1 or 'sample_data/sample_file1.xlsx' }}.</small>
         </div>
         <div class="form-group">
-          <label for="file2">📄 Second Excel File</label>
-          <input type="file" id="file2" name="file2" accept=".xlsx,.xls" required />
-          <small>Matched rows will come from this file.</small>
+          <label for="file2">📄 File 2 (Comparison Excel)</label>
+          <input type="file" id="file2" name="file2" accept=".xlsx,.xls" />
+          <small>Leave empty to use {{ default_file2 or 'sample_data/sample_file2.xlsx' }}.</small>
         </div>
+      </div>
+
+      <div class="form-row">
+        {% for file_index in range(3, (max_upload_files or 8) + 1) %}
+        <div class="form-group">
+          <label for="file{{ file_index }}">📄 File {{ file_index }} (Optional Comparison)</label>
+          <input type="file" id="file{{ file_index }}" name="file{{ file_index }}" accept=".xlsx,.xls" />
+          <small>Optional. Used after previous unmatched rows.</small>
+        </div>
+        {% endfor %}
       </div>
       <button type="submit" class="btn btn-primary">Upload &amp; Configure →</button>
     </form>
@@ -40,13 +63,14 @@
     <section class="how-it-works">
       <h2>How It Works</h2>
       <ol>
-        <li>Upload your two Excel files above.</li>
+        <li>Upload File 1 as the order file, then upload File 2 to File 8 as comparison files.</li>
         <li>Select which column in File&nbsp;1 maps to which column in File&nbsp;2 for each comparison.</li>
         <li>Choose the data type and comparison operator for each criterion.</li>
         <li>Add as many comparison criteria as needed.</li>
+        <li>The app compares File&nbsp;1 with File&nbsp;2 first. Then it compares previous unmatched rows with File&nbsp;3, then File&nbsp;4, and so on until comparison files end.</li>
         <li>Click <strong>Compare</strong> to download a ZIP containing:<br/>
-            &nbsp;&nbsp;• <code>matched.xlsx</code> – rows from File&nbsp;2 that matched File&nbsp;1<br/>
-            &nbsp;&nbsp;• <code>unmatched.xlsx</code> – rows from File&nbsp;1 with no match in File&nbsp;2
+            &nbsp;&nbsp;• <code>matched.xlsx</code> – combined matched rows from all comparison files<br/>
+            &nbsp;&nbsp;• <code>unmatched.xlsx</code> – rows from File&nbsp;1 still unmatched after all comparisons
         </li>
       </ol>
     </section>
