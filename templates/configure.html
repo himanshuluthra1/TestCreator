@@ -30,6 +30,18 @@
     {% endif %}
 
     <form action="/compare" method="post" id="compareForm">
+      <div class="form-row" style="margin-bottom: 1rem;">
+        <div class="form-group" style="max-width: 280px;">
+          <label for="expiry_window">Expiry Date Window</label>
+          <select id="expiry_window" name="expiry_window" required>
+            {% for value, label in expiry_options %}
+            <option value="{{ value }}" {% if value == selected_expiry_months %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+          <small>Rows are compared only when File 2 Expiry Date (MM-DD-YYYY) is after Today + selected months.</small>
+        </div>
+      </div>
+
       <div id="criteria-container">
         <!-- Criteria rows are added here by JS -->
       </div>
@@ -132,7 +144,7 @@
         const col1Select = row.querySelector('.col1-select');
         const col2Select = row.querySelector('.col2-select');
         const hasCol1 = setSelectValueIfPresent(col1Select, 'ProductName');
-        const hasCol2 = setSelectValueIfPresent(col2Select, 'ItemName');
+        const hasCol2 = setSelectValueIfPresent(col2Select, 'Drug Code');
         if (hasCol1 && hasCol2) {
           setSelectValueIfPresent(datatypeSelect, 'string');
           datatypeSelect.dispatchEvent(new Event('change'));

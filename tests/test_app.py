@@ -2,6 +2,7 @@
 
 import io
 import zipfile
+from datetime import datetime
 
 import pandas as pd
 import pytest
@@ -12,6 +13,7 @@ from app import (
     apply_operator,
     apply_scalar_operator,
     compare_dataframes,
+    read_excel,
     OPERATORS,
     DATATYPES,
 )
@@ -54,6 +56,22 @@ def test_cast_series_boolean():
     assert result[4] is False
     assert result[5] is False
     assert pd.isna(result[6])
+
+
+def test_read_excel_detects_drug_code_header_row(tmp_path):
+    path = tmp_path / "stock_with_banner.xlsx"
+    rows = [
+        ["Stock Report", "", "", ""],
+        ["Generated On", "03-11-2026", "", ""],
+        ["Drug Code", "CategoryType", "Location", "Expiry Date"],
+        ["D001", "Pain", "Delhi", "03-31-2026"],
+        ["D002", "Pain", "Delhi", "12-31-2026"],
+    ]
+    pd.DataFrame(rows).to_excel(path, index=False, header=False)
+
+    parsed = read_excel(str(path))
+    assert list(parsed.columns) == ["Drug Code", "CategoryType", "Location", "Expiry Date"]
+    assert list(parsed["Drug Code"]) == ["D001", "D002"]
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +293,20 @@ def _make_excel_bytes(data: dict) -> bytes:
     return buf.getvalue()
 
 
+def _expiry_month_label(month_offset: int) -> str:
+    base = datetime.now()
+    year = base.year + (base.month - 1 + month_offset) // 12
+    month = (base.month - 1 + month_offset) % 12 + 1
+    return datetime(year, month, 1).strftime("%b-%Y")
+
+
+def _expiry_mmddyyyy(month_offset: int) -> str:
+    base = datetime.now()
+    year = base.year + (base.month - 1 + month_offset) // 12
+    month = (base.month - 1 + month_offset) % 12 + 1
+    return datetime(year, month, 1).strftime("%m-%d-%Y")
+
+
 def test_index_get(client):
     resp = client.get("/")
     assert resp.status_code == 200
@@ -296,9 +328,62 @@ def test_stock_checker_page_get(client):
 
 
 def test_upload_missing_files(client):
-    resp = client.post("/upload", data={})
+    resp = client.post("/upload", data={}, follow_redirects=True)
     assert resp.status_code == 200
-    assert b"Please select" in resp.data
+    assert b"Configure" in resp.data or b"comparison criteria" in resp.data.lower()
+
+
+def test_upload_missing_file1_uses_default_order_sample(client):
+    excel2 = _make_excel_bytes({"FullName": ["Alice"]})
+
+    resp = client.post(
+        "/upload",
+        data={
+            "file2": (io.BytesIO(excel2), "file2.xlsx"),
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert resp.status_code == 302
+    with client.session_transaction() as sess:
+        assert sess["original1"] == "Order.xlsx"
+        assert sess["original2"] == "file2.xlsx"
+
+
+def test_upload_missing_file2_uses_default_second_sample(client):
+    excel1 = _make_excel_bytes({"Name": ["Alice"]})
+
+    resp = client.post(
+        "/upload",
+        data={
+            "file1": (io.BytesIO(excel1), "file1.xlsx"),
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert resp.status_code == 302
+    with client.session_transaction() as sess:
+        assert sess["original1"] == "file1.xlsx"
+        assert sess["original2"] == "Saanch - Copy.xlsx"
+
+
+def test_upload_with_sample_checkbox_and_uploaded_file_prefers_uploads(client):
+    excel1 = _make_excel_bytes({"MyCustomColumn": ["Alice"]})
+
+    resp = client.post(
+        "/upload",
+        data={
+            "use_sample_set": "1",
+            "file1": (io.BytesIO(excel1), "custom_file1.xlsx"),
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert resp.status_code == 302
+    with client.session_transaction() as sess:
+        assert sess["original1"] == "custom_file1.xlsx"
+        assert sess["original2"] == "Saanch - Copy.xlsx"
+        assert "MyCustomColumn" in sess["cols1"]
 
 
 def test_upload_wrong_extension(client):
@@ -314,7 +399,13 @@ def test_upload_wrong_extension(client):
 def test_full_compare_flow(client):
     """Upload two Excel files and run a comparison through the web interface."""
     excel1 = _make_excel_bytes({"Name": ["Alice", "Bob", "Dave"], "Score": [90, 75, 60]})
-    excel2 = _make_excel_bytes({"FullName": ["Alice", "Bob", "Charlie"], "Points": [90, 80, 70]})
+    excel2 = _make_excel_bytes(
+        {
+            "FullName": ["Alice", "Bob", "Charlie"],
+            "Points": [90, 80, 70],
+            "Expiry Date": [_expiry_month_label(10), _expiry_month_label(11), _expiry_month_label(2)],
+        }
+    )
 
     with client.session_transaction() as sess:
         pass  # ensure session started
@@ -358,15 +449,15 @@ def test_full_compare_flow(client):
     matched_df = pd.read_excel(io.BytesIO(matched_bytes))
     unmatched_df = pd.read_excel(io.BytesIO(unmatched_bytes))
 
-    assert set(matched_df["Name"]) == {"Alice", "Bob"}
+    assert set(matched_df["FullName"]) == {"Alice", "Bob"}
     assert list(unmatched_df["Name"]) == ["Dave"]
 
 
 def test_compare_generates_stepwise_outputs_for_multiple_files(client):
     """When multiple comparison files are uploaded, ZIP should include per-step outputs."""
     excel1 = _make_excel_bytes({"Name": ["Alice", "Bob", "Dave"]})
-    excel2 = _make_excel_bytes({"FullName": ["Alice"]})
-    excel3 = _make_excel_bytes({"FullName": ["Bob"]})
+    excel2 = _make_excel_bytes({"FullName": ["Alice"], "Expiry Date": [_expiry_month_label(1)]})
+    excel3 = _make_excel_bytes({"FullName": ["Bob"], "Expiry Date": [_expiry_month_label(2)]})
 
     upload_resp = client.post(
         "/upload",
@@ -405,6 +496,98 @@ def test_compare_generates_stepwise_outputs_for_multiple_files(client):
     # Final aliases should still exist.
     assert any(n.startswith("matched_") and "step" not in n for n in names)
     assert any(n.startswith("unmatched_") and "step" not in n for n in names)
+
+
+def test_compare_applies_expiry_window_filter(client):
+    excel1 = _make_excel_bytes({"Name": ["Alice", "Bob"]})
+    excel2 = _make_excel_bytes(
+        {
+            "FullName": ["Alice", "Bob"],
+            "Expiry Date": [_expiry_month_label(2), _expiry_month_label(10)],
+        }
+    )
+
+    upload_resp = client.post(
+        "/upload",
+        data={
+            "file1": (io.BytesIO(excel1), "orders.xlsx"),
+            "file2": (io.BytesIO(excel2), "compare.xlsx"),
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert upload_resp.status_code == 200
+
+    compare_resp = client.post(
+        "/compare",
+        data={
+            "expiry_window": "3",
+            "col1_0": "Name",
+            "col2_0": "FullName",
+            "datatype_0": "string",
+            "operator_0": "eq",
+        },
+        follow_redirects=True,
+    )
+    assert compare_resp.status_code == 200
+    assert compare_resp.content_type == "application/zip"
+
+    zf = zipfile.ZipFile(io.BytesIO(compare_resp.data))
+    names = zf.namelist()
+    matched_bytes = zf.read(next(n for n in names if n.startswith("matched_")))
+    unmatched_bytes = zf.read(next(n for n in names if n.startswith("unmatched_")))
+
+    matched_df = pd.read_excel(io.BytesIO(matched_bytes))
+    unmatched_df = pd.read_excel(io.BytesIO(unmatched_bytes))
+
+    assert list(matched_df["FullName"]) == ["Bob"]
+    assert list(unmatched_df["Name"]) == ["Alice"]
+
+
+def test_compare_applies_expiry_window_filter_mmddyyyy_format(client):
+    excel1 = _make_excel_bytes({"Name": ["Alice", "Bob"]})
+    excel2 = _make_excel_bytes(
+        {
+            "FullName": ["Alice", "Bob"],
+            "Expiry Date": [_expiry_mmddyyyy(2), _expiry_mmddyyyy(10)],
+        }
+    )
+
+    upload_resp = client.post(
+        "/upload",
+        data={
+            "file1": (io.BytesIO(excel1), "orders.xlsx"),
+            "file2": (io.BytesIO(excel2), "compare.xlsx"),
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert upload_resp.status_code == 200
+
+    compare_resp = client.post(
+        "/compare",
+        data={
+            "expiry_window": "3",
+            "col1_0": "Name",
+            "col2_0": "FullName",
+            "datatype_0": "string",
+            "operator_0": "eq",
+        },
+        follow_redirects=True,
+    )
+    assert compare_resp.status_code == 200
+    assert compare_resp.content_type == "application/zip"
+
+    zf = zipfile.ZipFile(io.BytesIO(compare_resp.data))
+    names = zf.namelist()
+    matched_bytes = zf.read(next(n for n in names if n.startswith("matched_")))
+    unmatched_bytes = zf.read(next(n for n in names if n.startswith("unmatched_")))
+
+    matched_df = pd.read_excel(io.BytesIO(matched_bytes))
+    unmatched_df = pd.read_excel(io.BytesIO(unmatched_bytes))
+
+    assert list(matched_df["FullName"]) == ["Bob"]
+    assert list(unmatched_df["Name"]) == ["Alice"]
 
 
 def test_download_input_file_after_upload(client):

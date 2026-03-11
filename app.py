@@ -13,6 +13,7 @@ import re
 import shutil
 import uuid
 import zipfile
+import calendar
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -85,6 +86,14 @@ DEFAULT_SAMPLE_COMPARISON_FILES = [
     "Vertex - Copy.xlsx",
 ]
 MAX_UPLOAD_FILES = 8
+EXPIRY_COLUMN_NAME = "Expiry Date"
+EXPIRY_WINDOW_OPTIONS = [
+    (3, "3 Months"),
+    (6, "6 Months"),
+    (9, "9 Months"),
+    (12, "12 Months"),
+]
+DEFAULT_EXPIRY_WINDOW_MONTHS = 9
 
 
 def allowed_file(filename: str) -> bool:
@@ -100,6 +109,24 @@ def safe_filename(filename: str) -> str:
 def read_excel(path: str) -> pd.DataFrame:
     """Read an Excel file and return a DataFrame with all values as strings
     (raw) in addition to a parsed version."""
+    raw_df = pd.read_excel(path, header=None, dtype=str, keep_default_na=False)
+
+    # Some stock files include banner/meta rows before the real header.
+    # If first-column value "Drug Code" exists near the top, treat that row as header.
+    if not raw_df.empty and raw_df.shape[1] > 0:
+        max_scan_rows = min(len(raw_df), 50)
+        for row_index in range(max_scan_rows):
+            first_col_value = str(raw_df.iat[row_index, 0]).strip().lower()
+            if first_col_value == "drug code":
+                headers = [str(value).strip() for value in raw_df.iloc[row_index].tolist()]
+                parsed_df = raw_df.iloc[row_index + 1 :].copy()
+                parsed_df.columns = headers
+                non_blank_columns = [
+                    col for col in parsed_df.columns if col and str(col).strip().lower() != "nan"
+                ]
+                parsed_df = parsed_df.loc[:, non_blank_columns]
+                return parsed_df.fillna("")
+
     return pd.read_excel(path, dtype=str, keep_default_na=False)
 
 
@@ -183,6 +210,60 @@ def reverse_order_operator(operator: str) -> str:
         "lte": "gte",
     }
     return mapping.get(operator, operator)
+
+
+def add_months(base_date: datetime, months: int) -> datetime:
+    """Return base_date shifted by *months* while keeping day-of-month when possible."""
+    month_index = base_date.month - 1 + months
+    year = base_date.year + month_index // 12
+    month = month_index % 12 + 1
+    last_day = calendar.monthrange(year, month)[1]
+    day = min(base_date.day, last_day)
+    return base_date.replace(year=year, month=month, day=day)
+
+
+def filter_by_expiry_window(df: pd.DataFrame, months: int) -> pd.DataFrame:
+    """Keep rows whose Expiry Date is beyond today + months.
+
+    Supported formats:
+    - MM-DD-YYYY (preferred, e.g. 03-31-2026)
+    - MMM-YYYY (legacy, e.g. Mar-2026)
+    - YYYY-MM-DD or full datetime text (e.g. 2026-03-31 00:00:00)
+    - Excel serial date numbers
+    """
+    if EXPIRY_COLUMN_NAME not in df.columns:
+        raise ValueError(f"Missing required comparison column: {EXPIRY_COLUMN_NAME}")
+
+    cutoff_date = add_months(datetime.now(), months).date()
+
+    raw_expiry_values = df[EXPIRY_COLUMN_NAME].astype(str).str.strip()
+
+    # Parse explicit known formats first, then fall back to flexible parsing.
+    parsed_mmddyyyy = pd.to_datetime(raw_expiry_values, format="%m-%d-%Y", errors="coerce")
+    parsed_mmmyyyy = pd.to_datetime(raw_expiry_values, format="%b-%Y", errors="coerce")
+    parsed_general = pd.to_datetime(raw_expiry_values, errors="coerce", format="mixed")
+    parsed_general_dayfirst = pd.to_datetime(
+        raw_expiry_values,
+        errors="coerce",
+        dayfirst=True,
+        format="mixed",
+    )
+
+    # Some Excel exports may contain serial day numbers as strings.
+    numeric_serial = pd.to_numeric(raw_expiry_values, errors="coerce")
+    parsed_excel_serial = pd.to_datetime(numeric_serial, unit="D", origin="1899-12-30", errors="coerce")
+
+    expiry_dates = (
+        parsed_mmddyyyy
+        .fillna(parsed_mmmyyyy)
+        .fillna(parsed_general)
+        .fillna(parsed_general_dayfirst)
+        .fillna(parsed_excel_serial)
+        .dt.date
+    )
+
+    valid_mask = expiry_dates.notna() & (expiry_dates > cutoff_date)
+    return df.loc[valid_mask].copy()
 
 
 def compare_dataframes(
@@ -333,6 +414,21 @@ def load_default_samples_into_session() -> bool:
     return True
 
 
+def copy_sample_file_to_uploads(sample_name: str, destination_name: str) -> str | None:
+    """Copy a bundled sample file into uploads and return stored filename.
+
+    Returns None when the source sample file does not exist.
+    """
+    sample_dir = os.path.join(os.path.dirname(__file__), "sample_data")
+    source_path = os.path.join(sample_dir, sample_name)
+    if not os.path.exists(source_path):
+        return None
+
+    dest_path = os.path.join(UPLOAD_FOLDER, destination_name)
+    shutil.copyfile(source_path, dest_path)
+    return destination_name
+
+
 def get_comparison_file_entries() -> list[dict[str, str]]:
     """Return comparison file metadata from session.
 
@@ -385,14 +481,18 @@ def upload():
     that will be used sequentially in /compare.
     """
     file1 = request.files.get("file1")
-    comparison_uploads = [request.files.get(f"file{i}") for i in range(2, MAX_UPLOAD_FILES + 1)]
+    file2 = request.files.get("file2")
+    optional_comparison_uploads = [request.files.get(f"file{i}") for i in range(3, MAX_UPLOAD_FILES + 1)]
+    all_uploads = [file1, file2, *optional_comparison_uploads]
 
     file1_missing = (not file1) or file1.filename == ""
-    provided_comparison_uploads = [f for f in comparison_uploads if f and f.filename != ""]
-    comparisons_missing = len(provided_comparison_uploads) == 0
+    file2_missing = (not file2) or file2.filename == ""
+    provided_optional_comparison_uploads = [f for f in optional_comparison_uploads if f and f.filename != ""]
+    comparisons_missing = file2_missing and len(provided_optional_comparison_uploads) == 0
     use_sample_set = request.form.get("use_sample_set") == "1"
+    has_any_uploaded_file = any(upload and upload.filename != "" for upload in all_uploads)
 
-    if use_sample_set:
+    if use_sample_set and not has_any_uploaded_file:
         if load_default_samples_into_session():
             return redirect(url_for("configure"))
         return render_template(
@@ -408,7 +508,7 @@ def upload():
         )
 
     # If user submits without selecting files, fall back to bundled defaults.
-    if not app.config.get("TESTING") and file1_missing and comparisons_missing:
+    if file1_missing and comparisons_missing:
         if load_default_samples_into_session():
             return redirect(url_for("configure"))
         return render_template(
@@ -421,15 +521,13 @@ def upload():
         )
 
     errors = []
-    if file1_missing:
-        errors.append("Please select the order Excel file (File 1).")
-    elif not allowed_file(file1.filename):
+    if not file1_missing and not allowed_file(file1.filename):
         errors.append("File 1 must be an Excel file (.xlsx or .xls).")
 
-    if comparisons_missing:
-        errors.append("Please select at least one comparison Excel file (File 2 to File 8).")
+    if not file2_missing and not allowed_file(file2.filename):
+        errors.append("File 2 must be an Excel file (.xlsx or .xls).")
 
-    for index, comp_file in enumerate(comparison_uploads, start=2):
+    for index, comp_file in enumerate(optional_comparison_uploads, start=3):
         if comp_file and comp_file.filename and not allowed_file(comp_file.filename):
             errors.append(f"File {index} must be an Excel file (.xlsx or .xls).")
 
@@ -443,12 +541,45 @@ def upload():
             max_upload_files=MAX_UPLOAD_FILES,
         )
 
-    fname1 = safe_filename(file1.filename)
-    path1 = os.path.join(UPLOAD_FOLDER, fname1)
-    file1.save(path1)
+    if file1_missing:
+        fname1 = copy_sample_file_to_uploads(DEFAULT_SAMPLE_FILE1, "default_sample_file1.xlsx")
+        if not fname1:
+            return render_template(
+                "index.html",
+                errors=[f"Default sample file is missing: sample_data/{DEFAULT_SAMPLE_FILE1}"],
+                default_file1=f"sample_data/{DEFAULT_SAMPLE_FILE1}",
+                default_file2=f"sample_data/{DEFAULT_SAMPLE_FILE2}",
+                default_comparison_files=DEFAULT_SAMPLE_COMPARISON_FILES,
+                max_upload_files=MAX_UPLOAD_FILES,
+            )
+        path1 = os.path.join(UPLOAD_FOLDER, fname1)
+        original_file1_name = DEFAULT_SAMPLE_FILE1
+    else:
+        fname1 = safe_filename(file1.filename)
+        path1 = os.path.join(UPLOAD_FOLDER, fname1)
+        file1.save(path1)
+        original_file1_name = file1.filename
 
     saved_comparison_entries = []
-    for comp_file in provided_comparison_uploads:
+    if file2_missing:
+        default_file2_stored = copy_sample_file_to_uploads(DEFAULT_SAMPLE_FILE2, "default_sample_file2.xlsx")
+        if not default_file2_stored:
+            return render_template(
+                "index.html",
+                errors=[f"Default sample file is missing: sample_data/{DEFAULT_SAMPLE_FILE2}"],
+                default_file1=f"sample_data/{DEFAULT_SAMPLE_FILE1}",
+                default_file2=f"sample_data/{DEFAULT_SAMPLE_FILE2}",
+                default_comparison_files=DEFAULT_SAMPLE_COMPARISON_FILES,
+                max_upload_files=MAX_UPLOAD_FILES,
+            )
+        saved_comparison_entries.append({"stored": default_file2_stored, "original": DEFAULT_SAMPLE_FILE2})
+    else:
+        file2_name = safe_filename(file2.filename)
+        file2_path = os.path.join(UPLOAD_FOLDER, file2_name)
+        file2.save(file2_path)
+        saved_comparison_entries.append({"stored": file2_name, "original": file2.filename})
+
+    for comp_file in provided_optional_comparison_uploads:
         comp_name = safe_filename(comp_file.filename)
         comp_path = os.path.join(UPLOAD_FOLDER, comp_name)
         comp_file.save(comp_path)
@@ -470,7 +601,7 @@ def upload():
     session["file1"] = fname1
     session["file2"] = saved_comparison_entries[0]["stored"]
     session["comparison_files"] = saved_comparison_entries
-    session["original1"] = file1.filename
+    session["original1"] = original_file1_name
     session["original2"] = saved_comparison_entries[0]["original"]
     session["cols1"] = list(df1.columns)
     session["cols2"] = list(df2.columns)
@@ -494,6 +625,8 @@ def configure():
         original1=session.get("original1", "File 1"),
         original2=session.get("original2", "File 2"),
         comparison_count=len(get_comparison_file_entries()),
+        expiry_options=EXPIRY_WINDOW_OPTIONS,
+        selected_expiry_months=DEFAULT_EXPIRY_WINDOW_MONTHS,
     )
 
 
@@ -570,8 +703,16 @@ def compare():
             original1=session.get("original1", "File 1"),
             original2=session.get("original2", "File 2"),
             comparison_count=len(comparison_entries),
+            expiry_options=EXPIRY_WINDOW_OPTIONS,
+            selected_expiry_months=DEFAULT_EXPIRY_WINDOW_MONTHS,
             errors=[f"Could not read Excel files: {exc}"],
         )
+
+    selected_expiry_months = request.form.get("expiry_window", str(DEFAULT_EXPIRY_WINDOW_MONTHS))
+    valid_expiry_values = {str(value) for value, _label in EXPIRY_WINDOW_OPTIONS}
+    if selected_expiry_months not in valid_expiry_values:
+        selected_expiry_months = str(DEFAULT_EXPIRY_WINDOW_MONTHS)
+    selected_expiry_months_int = int(selected_expiry_months)
 
     # Parse criteria from the form
     # Fields are submitted as: col1_0, col2_0, datatype_0, operator_0, col1_1, ...
@@ -602,6 +743,8 @@ def compare():
             original1=session.get("original1", "File 1"),
             original2=session.get("original2", "File 2"),
             comparison_count=len(comparison_entries),
+            expiry_options=EXPIRY_WINDOW_OPTIONS,
+            selected_expiry_months=selected_expiry_months_int,
             errors=["Please add at least one comparison criterion."],
         )
 
@@ -614,6 +757,22 @@ def compare():
                 break
 
             df_compare = read_excel(os.path.join(UPLOAD_FOLDER, entry["stored"]))
+            try:
+                df_compare = filter_by_expiry_window(df_compare, selected_expiry_months_int)
+            except ValueError as exc:
+                return render_template(
+                    "configure.html",
+                    cols1=session.get("cols1", []),
+                    cols2=session.get("cols2", []),
+                    datatypes=DATATYPES,
+                    operators_json=json.dumps(OPERATORS),
+                    original1=session.get("original1", "File 1"),
+                    original2=session.get("original2", "File 2"),
+                    comparison_count=len(comparison_entries),
+                    expiry_options=EXPIRY_WINDOW_OPTIONS,
+                    selected_expiry_months=selected_expiry_months_int,
+                    errors=[f"{entry['original']}: {exc}"],
+                )
 
             missing_col1 = [c["col1"] for c in criteria if c["col1"] not in unmatched_working.columns]
             missing_col2 = [c["col2"] for c in criteria if c["col2"] not in df_compare.columns]
@@ -627,6 +786,8 @@ def compare():
                     original1=session.get("original1", "File 1"),
                     original2=session.get("original2", "File 2"),
                     comparison_count=len(comparison_entries),
+                    expiry_options=EXPIRY_WINDOW_OPTIONS,
+                    selected_expiry_months=selected_expiry_months_int,
                     errors=[f"Missing column(s) in File 1/unmatched data: {', '.join(sorted(set(missing_col1)))}"],
                 )
             if missing_col2:
@@ -639,6 +800,8 @@ def compare():
                     original1=session.get("original1", "File 1"),
                     original2=session.get("original2", "File 2"),
                     comparison_count=len(comparison_entries),
+                    expiry_options=EXPIRY_WINDOW_OPTIONS,
+                    selected_expiry_months=selected_expiry_months_int,
                     errors=[
                         f"Missing required comparison column(s) in {entry['original']}: "
                         f"{', '.join(sorted(set(missing_col2)))}"
@@ -652,16 +815,13 @@ def compare():
                 criteria,
             )
 
-            # Matched output should contain order-side rows (File 1 perspective)
-            # that matched in this specific comparison step.
-            matched_order_rows = current_unmatched_input.loc[
-                ~current_unmatched_input.index.isin(next_unmatched.index)
-            ]
+            # Matched output should contain comparison-side rows (File 2 perspective),
+            # including columns like Drug Code from the stock file.
             per_step_results.append(
                 {
                     "step": len(per_step_results) + 1,
                     "comparison_name": entry["original"],
-                    "matched": matched_order_rows.reset_index(drop=True),
+                    "matched": _matched_df2.reset_index(drop=True),
                     "unmatched": next_unmatched.reset_index(drop=True),
                 }
             )
@@ -684,6 +844,8 @@ def compare():
             original1=session.get("original1", "File 1"),
             original2=session.get("original2", "File 2"),
             comparison_count=len(comparison_entries),
+            expiry_options=EXPIRY_WINDOW_OPTIONS,
+            selected_expiry_months=selected_expiry_months_int,
             errors=[f"Could not compare Excel files: {exc}"],
         )
 

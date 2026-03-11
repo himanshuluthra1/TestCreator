@@ -13,7 +13,7 @@ Quick test steps:
 2. Open http://127.0.0.1:5000 in your browser.
 3. Keep file inputs empty and submit to use defaults, or upload sample_data/sample_file1.xlsx and sample_data/sample_file2.xlsx manually.
 4. Add criteria using this mapping:
-	- ProductName -> ItemName (string, contains)
+	- ProductName -> Drug Code (string, contains)
 	- Category -> CategoryType (string, eq)
 	- Warehouse -> Location (string, eq)
 	- ExpectedQty -> StockQty (number, eq)
