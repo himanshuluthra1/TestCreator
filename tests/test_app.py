@@ -392,7 +392,7 @@ def test_upload_missing_file2_uses_default_second_sample(client):
     assert resp.status_code == 302
     with client.session_transaction() as sess:
         assert sess["original1"] == "file1.xlsx"
-        assert sess["original2"] == "Saanch - Copy.xlsx"
+        assert sess["original2"] == "Saanch1.xlsx"
 
 
 def test_upload_with_sample_checkbox_and_uploaded_file_prefers_uploads(client):
@@ -410,7 +410,7 @@ def test_upload_with_sample_checkbox_and_uploaded_file_prefers_uploads(client):
     assert resp.status_code == 302
     with client.session_transaction() as sess:
         assert sess["original1"] == "custom_file1.xlsx"
-        assert sess["original2"] == "Saanch - Copy.xlsx"
+        assert sess["original2"] == "Saanch1.xlsx"
         assert "MyCustomColumn" in sess["cols1"]
 
 
@@ -477,7 +477,8 @@ def test_full_compare_flow(client):
     matched_df = pd.read_excel(io.BytesIO(matched_bytes))
     unmatched_df = pd.read_excel(io.BytesIO(unmatched_bytes))
 
-    assert set(matched_df["FullName"]) == {"Alice", "Bob"}
+    assert set(matched_df["Drug Code"]) == {"Alice", "Bob"}
+    assert set(pd.to_numeric(matched_df["Qty"], errors="coerce")) == {1.0}
     assert list(unmatched_df["Drug Code"]) == ["Dave"]
 
     import app as app_module
@@ -580,7 +581,8 @@ def test_compare_applies_expiry_window_filter(client):
     matched_df = pd.read_excel(io.BytesIO(matched_bytes))
     unmatched_df = pd.read_excel(io.BytesIO(unmatched_bytes))
 
-    assert list(matched_df["FullName"]) == ["Bob"]
+    assert list(matched_df["Drug Code"]) == ["Bob"]
+    assert list(pd.to_numeric(matched_df["Qty"], errors="coerce")) == [1.0]
     assert list(unmatched_df["Drug Code"]) == ["Alice"]
 
 
@@ -626,8 +628,107 @@ def test_compare_applies_expiry_window_filter_mmddyyyy_format(client):
     matched_df = pd.read_excel(io.BytesIO(matched_bytes))
     unmatched_df = pd.read_excel(io.BytesIO(unmatched_bytes))
 
-    assert list(matched_df["FullName"]) == ["Bob"]
+    assert list(matched_df["Drug Code"]) == ["Bob"]
+    assert list(pd.to_numeric(matched_df["Qty"], errors="coerce")) == [1.0]
     assert list(unmatched_df["Drug Code"]) == ["Alice"]
+
+
+def test_compare_ignores_expiry_validation_when_column_missing(client):
+    excel1 = _make_excel_bytes({"Name": ["Alice", "Bob"]})
+    excel2 = _make_excel_bytes(
+        {
+            "FullName": ["Alice", "Bob"],
+        }
+    )
+
+    upload_resp = client.post(
+        "/upload",
+        data={
+            "file1": (io.BytesIO(excel1), "orders.xlsx"),
+            "file2": (io.BytesIO(excel2), "compare.xlsx"),
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert upload_resp.status_code == 200
+
+    compare_resp = client.post(
+        "/compare",
+        data={
+            "expiry_window": "3",
+            "col1_0": "Name",
+            "col2_0": "FullName",
+            "datatype_0": "string",
+            "operator_0": "eq",
+        },
+        follow_redirects=True,
+    )
+    assert compare_resp.status_code == 200
+    assert compare_resp.content_type == "application/zip"
+
+    zf = zipfile.ZipFile(io.BytesIO(compare_resp.data))
+    names = zf.namelist()
+    matched_bytes = zf.read(next(n for n in names if n.startswith("matched_")))
+    unmatched_bytes = zf.read(next(n for n in names if n.startswith("unmatched_")))
+
+    matched_df = pd.read_excel(io.BytesIO(matched_bytes))
+    unmatched_df = pd.read_excel(io.BytesIO(unmatched_bytes))
+
+    assert set(matched_df["Drug Code"]) == {"Alice", "Bob"}
+    assert set(pd.to_numeric(matched_df["Qty"], errors="coerce")) == {1.0}
+    assert unmatched_df.empty
+
+
+def test_compare_allocates_partial_qty_and_carries_remaining(client):
+    excel1 = _make_excel_bytes({"Drug Code": ["D001"], "Required Qty": [100]})
+    excel2 = _make_excel_bytes(
+        {
+            "Drug Code": ["D001", "D001"],
+            "StockQty": [30, 50],
+            "Expiry Date": [_expiry_month_label(10), _expiry_month_label(10)],
+        }
+    )
+
+    upload_resp = client.post(
+        "/upload",
+        data={
+            "file1": (io.BytesIO(excel1), "orders.xlsx"),
+            "file2": (io.BytesIO(excel2), "compare.xlsx"),
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+    assert upload_resp.status_code == 200
+
+    compare_resp = client.post(
+        "/compare",
+        data={
+            "col1_0": "Drug Code",
+            "col2_0": "Drug Code",
+            "datatype_0": "string",
+            "operator_0": "eq",
+            "col1_1": "Required Qty",
+            "col2_1": "StockQty",
+            "datatype_1": "number",
+            "operator_1": "lte",
+        },
+        follow_redirects=True,
+    )
+    assert compare_resp.status_code == 200
+    assert compare_resp.content_type == "application/zip"
+
+    zf = zipfile.ZipFile(io.BytesIO(compare_resp.data))
+    names = zf.namelist()
+    matched_bytes = zf.read(next(n for n in names if n.startswith("matched_")))
+    unmatched_bytes = zf.read(next(n for n in names if n.startswith("unmatched_")))
+
+    matched_df = pd.read_excel(io.BytesIO(matched_bytes))
+    unmatched_df = pd.read_excel(io.BytesIO(unmatched_bytes))
+
+    assert list(matched_df["Drug Code"]) == ["D001"]
+    assert list(pd.to_numeric(matched_df["Qty"], errors="coerce")) == [80.0]
+    assert list(unmatched_df["Drug Code"]) == ["D001"]
+    assert list(pd.to_numeric(unmatched_df["Remaining Qty"], errors="coerce")) == [20.0]
 
 
 def test_download_input_file_after_upload(client):

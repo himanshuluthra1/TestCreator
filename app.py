@@ -79,14 +79,24 @@ DATATYPES = [
 ]
 
 DEFAULT_SAMPLE_FILE1 = "Order.xlsx"
-DEFAULT_SAMPLE_FILE2 = "Saanch - Copy.xlsx"
+DEFAULT_SAMPLE_FILE2 = "Saanch1.xlsx"
 DEFAULT_SAMPLE_COMPARISON_FILES = [
-    "Saanch - Copy.xlsx",
-    "GPVDS - Copy.xlsx",
-    "Vertex - Copy.xlsx",
+    "Saanch1.xlsx",
+    "GPVDS1.xlsx",
+    "Vertex1.xlsx",
 ]
 MAX_UPLOAD_FILES = 8
 EXPIRY_COLUMN_NAME = "Expiry Date"
+# Common column names used for stock quantity in supplier files.
+_QTY_SYNONYMS = ["Qty", "qty", "stock", "Stock", "quantity", "Quantity", "available", "Available"]
+
+
+def _auto_qty_column(df: pd.DataFrame, exclude_cols: set) -> str | None:
+    """Return the first qty-like column in df not in exclude_cols."""
+    for syn in _QTY_SYNONYMS:
+        if syn in df.columns and syn not in exclude_cols:
+            return syn
+    return None
 EXPIRY_WINDOW_OPTIONS = [
     (3, "3 Months"),
     (6, "6 Months"),
@@ -144,7 +154,7 @@ def cast_series(series: pd.Series, datatype: str) -> pd.Series:
              "false": False, "0": False, "no": False}
         )
     # string – strip whitespace for cleaner comparison
-    return series.str.strip()
+    return series.astype(str).str.strip()
 
 
 def apply_operator(left: pd.Series, right_scalar, operator: str) -> pd.Series:
@@ -382,7 +392,9 @@ def adapt_criteria_for_input(base_criteria: list[dict], left_columns: list[str])
     for crit in base_criteria:
         mapped_col1 = crit["col1"]
         if mapped_col1 not in left_columns:
-            if crit["datatype"] == "number" and "Remaining Qty" in left_columns:
+            if crit["datatype"] == "number" and "Qty" in left_columns:
+                mapped_col1 = "Qty"
+            elif crit["datatype"] == "number" and "Remaining Qty" in left_columns:
                 mapped_col1 = "Remaining Qty"
             elif crit["datatype"] != "number" and "Drug Code" in left_columns:
                 mapped_col1 = "Drug Code"
@@ -404,13 +416,15 @@ def build_unmatched_summary(
     unmatched_rows: pd.DataFrame,
     criteria: list[dict],
 ) -> pd.DataFrame:
-    """Return unmatched rows in normalized shape: Drug Code + Remaining Qty.
+    """Return rows with remaining demand after this stock file, Drug Code + Remaining Qty.
 
-    Remaining Qty is computed as:
-      left numeric target - sum(right numeric values matched by non-number criteria)
-    clamped at zero.
+    Iterates ALL left_df rows so that partially-satisfied rows (Drug Code found
+    but available stock < required qty) are also carried forward with the correct
+    shortfall.  For rows that were fully matched (remaining = 0), they are omitted.
+    When no qty criterion is configured, falls back to compare_dataframes unmatched
+    results for rows where available stock cannot be determined.
     """
-    if unmatched_rows.empty:
+    if left_df.empty:
         return pd.DataFrame(columns=["Drug Code", "Remaining Qty"])
 
     if not criteria:
@@ -424,33 +438,41 @@ def build_unmatched_summary(
 
     non_number_criteria = [c for c in criteria if c["datatype"] != "number"]
     number_criteria = [c for c in criteria if c["datatype"] == "number"]
-    primary_number = number_criteria[0] if number_criteria else None
+    # eq-typed number criteria act as identifiers (like string criteria), non-eq are quantity criteria
+    eq_number_criteria = [c for c in number_criteria if c["operator"] == "eq"]
+    qty_number_criteria = [c for c in number_criteria if c["operator"] != "eq"]
+    effective_non_number = non_number_criteria + eq_number_criteria
+    primary_number = qty_number_criteria[0] if qty_number_criteria else (
+        number_criteria[0] if (number_criteria and not eq_number_criteria) else None
+    )
 
-    if "Drug Code" in unmatched_rows.columns:
+    id_cols = {c["col2"] for c in effective_non_number}
+    unmatched_idx = set(unmatched_rows.index)
+
+    if "Drug Code" in left_df.columns:
         drug_code_col = "Drug Code"
     elif non_number_criteria:
         drug_code_col = non_number_criteria[0]["col1"]
     else:
-        drug_code_col = unmatched_rows.columns[0]
+        drug_code_col = left_df.columns[0]
 
     records = []
-    for idx in unmatched_rows.index:
-        if idx not in left_cast.index:
-            continue
-
-        original_row = unmatched_rows.loc[idx]
+    for idx in left_df.index:
+        original_row = left_df.loc[idx]
         left_row = left_cast.loc[idx]
 
         remaining_qty = None
-        if primary_number:
-            base_mask = pd.Series([True] * len(right_cast), index=right_cast.index)
-            for crit in non_number_criteria:
-                base_mask = base_mask & apply_operator(
-                    right_cast[crit["col2"]],
-                    left_row[crit["col1"]],
-                    crit["operator"],
-                )
 
+        # Build identifier match mask against right_df
+        base_mask = pd.Series([True] * len(right_cast), index=right_cast.index)
+        for crit in effective_non_number:
+            base_mask = base_mask & apply_operator(
+                right_cast[crit["col2"]],
+                left_row[crit["col1"]],
+                crit["operator"],
+            )
+
+        if primary_number:
             total_series = (
                 right_cast.loc[base_mask, primary_number["col2"]]
                 .astype(str)
@@ -473,26 +495,62 @@ def build_unmatched_summary(
                     remaining_qty = max(float(target_value) - float(total_value), 0.0)
                 else:
                     remaining_qty = float(target_value)
+        else:
+            # No explicit qty criterion: try to auto-detect qty column in right_df
+            req_field = next((f for f in ("Remaining Qty", "Qty") if f in left_row.index), None)
+            auto_col = _auto_qty_column(right_cast, id_cols)
+
+            if req_field and auto_col:
+                # We can compute actual remaining from available stock
+                req_raw = pd.to_numeric(
+                    pd.Series([left_row[req_field]])
+                    .astype(str)
+                    .str.replace(",", "", regex=False)
+                    .str.strip()
+                    .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA}),
+                    errors="coerce",
+                ).iloc[0]
+                if pd.notna(req_raw):
+                    req_qty = float(req_raw)
+                    if base_mask.any():
+                        avail_series = (
+                            right_cast.loc[base_mask, auto_col]
+                            .astype(str)
+                            .str.replace(",", "", regex=False)
+                            .str.strip()
+                            .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+                        )
+                        avail_sum = pd.to_numeric(avail_series, errors="coerce").sum(min_count=1)
+                        if pd.notna(avail_sum):
+                            remaining_qty = max(req_qty - float(avail_sum), 0.0)
+                        else:
+                            remaining_qty = req_qty
+                    else:
+                        # Drug Code not present in right_df: full qty carries forward
+                        remaining_qty = req_qty
+            else:
+                # Cannot determine qty from right_df: fall back to compare_dataframes result
+                # Only include rows that compare_dataframes flagged as unmatched
+                if idx not in unmatched_idx:
+                    continue  # matched row with no qty info → assume satisfied
+
+        # Skip rows fully satisfied by this stock file
+        if isinstance(remaining_qty, float) and not pd.isna(remaining_qty) and remaining_qty <= 0:
+            continue
 
         if remaining_qty is None:
-            if "Remaining Qty" in original_row:
-                remaining_qty = pd.to_numeric(
-                    pd.Series([original_row["Remaining Qty"]])
-                    .astype(str)
-                    .str.replace(",", "", regex=False)
-                    .str.strip()
-                    .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA}),
-                    errors="coerce",
-                ).iloc[0]
-            elif primary_number and primary_number["col1"] in original_row:
-                remaining_qty = pd.to_numeric(
-                    pd.Series([original_row[primary_number["col1"]]])
-                    .astype(str)
-                    .str.replace(",", "", regex=False)
-                    .str.strip()
-                    .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA}),
-                    errors="coerce",
-                ).iloc[0]
+            # Fallback: carry forward whatever qty is on the original row
+            for fld in ("Remaining Qty", "Qty"):
+                if fld in original_row:
+                    remaining_qty = pd.to_numeric(
+                        pd.Series([original_row[fld]])
+                        .astype(str)
+                        .str.replace(",", "", regex=False)
+                        .str.strip()
+                        .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA}),
+                        errors="coerce",
+                    ).iloc[0]
+                    break
             else:
                 remaining_qty = ""
 
@@ -507,6 +565,139 @@ def build_unmatched_summary(
     if not summary_df.empty:
         qty_numeric = pd.to_numeric(summary_df["Remaining Qty"], errors="coerce")
         summary_df["Remaining Qty"] = qty_numeric.where(qty_numeric.isna(), qty_numeric.round(6))
+    return summary_df
+
+
+def build_order_summary(
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    criteria: list[dict],
+) -> pd.DataFrame:
+    """Return allocated order rows in normalized shape: Drug Code + Qty.
+
+    Qty is computed per left row as min(required_qty, summed matching stock qty).
+    """
+    if left_df.empty or not criteria:
+        return pd.DataFrame(columns=["Drug Code", "Qty"])
+
+    left_cast = left_df.copy()
+    right_cast = right_df.copy()
+    for crit in criteria:
+        left_cast[crit["col1"]] = cast_series(left_cast[crit["col1"]], crit["datatype"])
+        right_cast[crit["col2"]] = cast_series(right_cast[crit["col2"]], crit["datatype"])
+
+    non_number_criteria = [c for c in criteria if c["datatype"] != "number"]
+    number_criteria = [c for c in criteria if c["datatype"] == "number"]
+    # eq-typed number criteria act as identifiers (like string criteria), non-eq are quantity criteria
+    eq_number_criteria = [c for c in number_criteria if c["operator"] == "eq"]
+    qty_number_criteria = [c for c in number_criteria if c["operator"] != "eq"]
+    effective_non_number = non_number_criteria + eq_number_criteria
+    primary_number = qty_number_criteria[0] if qty_number_criteria else (
+        number_criteria[0] if (number_criteria and not eq_number_criteria) else None
+    )
+
+    if "Drug Code" in left_df.columns:
+        drug_code_col = "Drug Code"
+    elif effective_non_number:
+        drug_code_col = effective_non_number[0]["col1"]
+    else:
+        drug_code_col = left_df.columns[0]
+
+    records = []
+    for idx in left_df.index:
+        if idx not in left_cast.index:
+            continue
+
+        original_row = left_df.loc[idx]
+        left_row = left_cast.loc[idx]
+
+        base_mask = pd.Series([True] * len(right_cast), index=right_cast.index)
+        for crit in effective_non_number:
+            base_mask = base_mask & apply_operator(
+                right_cast[crit["col2"]],
+                left_row[crit["col1"]],
+                crit["operator"],
+            )
+
+        if primary_number is None:
+            if not base_mask.any():
+                continue
+
+            # Get required qty from the left row
+            req_field = next((f for f in ("Qty", "Remaining Qty") if f in original_row.index), None)
+            if req_field:
+                req_raw = pd.to_numeric(
+                    pd.Series([original_row[req_field]])
+                    .astype(str)
+                    .str.replace(",", "", regex=False)
+                    .str.strip()
+                    .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA}),
+                    errors="coerce",
+                ).iloc[0]
+                if pd.isna(req_raw) or float(req_raw) <= 0:
+                    continue
+                req_qty = float(req_raw)
+            else:
+                req_qty = 1.0
+
+            # Constrain by available stock using auto-detected qty column
+            id_cols = {c["col2"] for c in effective_non_number}
+            auto_col = _auto_qty_column(right_cast, id_cols)
+            if auto_col:
+                avail_series = (
+                    right_cast.loc[base_mask, auto_col]
+                    .astype(str)
+                    .str.replace(",", "", regex=False)
+                    .str.strip()
+                    .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+                )
+                avail_sum = pd.to_numeric(avail_series, errors="coerce").sum(min_count=1)
+                if pd.notna(avail_sum) and float(avail_sum) > 0:
+                    allocated_qty = min(req_qty, float(avail_sum))
+                else:
+                    allocated_qty = req_qty
+            else:
+                allocated_qty = req_qty
+
+            if allocated_qty <= 0:
+                continue
+            allocated_qty = float(allocated_qty)
+        else:
+            total_series = (
+                right_cast.loc[base_mask, primary_number["col2"]]
+                .astype(str)
+                .str.replace(",", "", regex=False)
+                .str.strip()
+                .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+            )
+            total_value = pd.to_numeric(total_series, errors="coerce").sum(min_count=1)
+            target_value = pd.to_numeric(
+                pd.Series([left_row[primary_number["col1"]]])
+                .astype(str)
+                .str.replace(",", "", regex=False)
+                .str.strip()
+                .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA}),
+                errors="coerce",
+            ).iloc[0]
+
+            if pd.isna(total_value) or pd.isna(target_value):
+                continue
+
+            allocated_qty = min(float(target_value), float(total_value))
+            if allocated_qty <= 0:
+                continue
+
+        records.append(
+            {
+                "Drug Code": str(original_row.get(drug_code_col, "")).strip(),
+                "Qty": allocated_qty,
+            }
+        )
+
+    summary_df = pd.DataFrame(records, columns=["Drug Code", "Qty"])
+    if not summary_df.empty:
+        qty_numeric = pd.to_numeric(summary_df["Qty"], errors="coerce")
+        summary_df["Qty"] = qty_numeric.where(qty_numeric.isna(), qty_numeric.round(6))
     return summary_df
 
 
@@ -904,22 +1095,8 @@ def compare():
                 break
 
             df_compare = read_excel(os.path.join(UPLOAD_FOLDER, entry["stored"]))
-            try:
+            if EXPIRY_COLUMN_NAME in df_compare.columns:
                 df_compare = filter_by_expiry_window(df_compare, selected_expiry_months_int)
-            except ValueError as exc:
-                return render_template(
-                    "configure.html",
-                    cols1=session.get("cols1", []),
-                    cols2=session.get("cols2", []),
-                    datatypes=DATATYPES,
-                    operators_json=json.dumps(OPERATORS),
-                    original1=session.get("original1", "File 1"),
-                    original2=session.get("original2", "File 2"),
-                    comparison_count=len(comparison_entries),
-                    expiry_options=EXPIRY_WINDOW_OPTIONS,
-                    selected_expiry_months=selected_expiry_months_int,
-                    errors=[f"{entry['original']}: {exc}"],
-                )
 
             step_criteria, unresolved_left = adapt_criteria_for_input(criteria, list(unmatched_working.columns))
             missing_col2 = [c["col2"] for c in step_criteria if c["col2"] not in df_compare.columns]
@@ -937,7 +1114,7 @@ def compare():
                     selected_expiry_months=selected_expiry_months_int,
                     errors=[
                         "No valid criteria could be applied to chained unmatched data. "
-                        "Ensure criteria include Drug Code (string) and Remaining Qty (number)."
+                        "Ensure criteria include Drug Code (string) and Qty/Remaining Qty (number)."
                     ],
                 )
             if unresolved_left:
@@ -981,6 +1158,11 @@ def compare():
                 df_compare,
                 step_criteria,
             )
+            step_order = build_order_summary(
+                current_unmatched_input,
+                df_compare,
+                step_criteria,
+            )
             next_unmatched_summary = build_unmatched_summary(
                 current_unmatched_input,
                 df_compare,
@@ -988,13 +1170,11 @@ def compare():
                 step_criteria,
             )
 
-            # Matched output should contain comparison-side rows (File 2 perspective),
-            # including columns like Drug Code from the stock file.
             per_step_results.append(
                 {
                     "step": len(per_step_results) + 1,
                     "comparison_name": entry["original"],
-                    "matched": _matched_df2.reset_index(drop=True),
+                    "matched": step_order.reset_index(drop=True),
                     "unmatched": next_unmatched_summary.reset_index(drop=True),
                 }
             )
