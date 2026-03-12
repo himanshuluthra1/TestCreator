@@ -133,7 +133,9 @@ def read_excel(path: str) -> pd.DataFrame:
 def cast_series(series: pd.Series, datatype: str) -> pd.Series:
     """Cast a pandas Series to the requested datatype."""
     if datatype == "number":
-        return pd.to_numeric(series, errors="coerce")
+        cleaned = series.astype(str).str.replace(",", "", regex=False).str.strip()
+        cleaned = cleaned.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+        return pd.to_numeric(cleaned, errors="coerce")
     if datatype == "date":
         return pd.to_datetime(series, errors="coerce")
     if datatype == "boolean":
@@ -230,11 +232,9 @@ def filter_by_expiry_window(df: pd.DataFrame, months: int) -> pd.DataFrame:
     - MMM-YYYY (legacy, e.g. Mar-2026)
     - YYYY-MM-DD or full datetime text (e.g. 2026-03-31 00:00:00)
     - Excel serial date numbers
-
-    If Expiry Date is not present, the DataFrame is returned unchanged.
     """
     if EXPIRY_COLUMN_NAME not in df.columns:
-        return df.copy()
+        raise ValueError(f"Missing required comparison column: {EXPIRY_COLUMN_NAME}")
 
     cutoff_date = add_months(datetime.now(), months).date()
 
@@ -304,18 +304,14 @@ def compare_dataframes(
     non_number_criteria = [c for c in criteria if c["datatype"] != "number"]
     number_criteria = [c for c in criteria if c["datatype"] == "number"]
 
-    # If number criteria are present with other criteria, compare grouped sums:
-    # SUM(file1 qty) OP SUM(file2 qty) for each non-number key group.
-    if number_criteria and non_number_criteria:
-        group_cols = list(dict.fromkeys(c["col1"] for c in non_number_criteria))
-        grouped_df1 = df1_cast.groupby(group_cols, dropna=False, sort=False)
-
-        for _group_key, df1_group in grouped_df1:
+    for i1, row1 in df1_cast.iterrows():
+        # If number criteria are present with other criteria, sum matching number
+        # values in df2 and compare total against df1 numeric value.
+        if number_criteria and non_number_criteria:
             base_mask = pd.Series([True] * len(df2_cast), index=df2_cast.index)
             for crit in non_number_criteria:
                 col1, col2, operator = crit["col1"], crit["col2"], crit["operator"]
-                group_value = df1_group.iloc[0][col1]
-                row_mask = apply_operator(df2_cast[col2], group_value, operator)
+                row_mask = apply_operator(df2_cast[col2], row1[col1], operator)
                 base_mask = base_mask & row_mask
 
             if not base_mask.any():
@@ -324,27 +320,28 @@ def compare_dataframes(
             numeric_match = True
             for crit in number_criteria:
                 col1, col2, operator = crit["col1"], crit["col2"], crit["operator"]
-                file1_sum = pd.to_numeric(df1_group[col1], errors="coerce").sum(min_count=1)
-                file2_sum = pd.to_numeric(df2_cast.loc[base_mask, col2], errors="coerce").sum(min_count=1)
+                total_series = (
+                    df2_cast.loc[base_mask, col2]
+                    .astype(str)
+                    .str.replace(",", "", regex=False)
+                    .str.strip()
+                    .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+                )
+                total_value = pd.to_numeric(total_series, errors="coerce").sum(min_count=1)
+                target_value = row1[col1]
 
-                if pd.isna(file1_sum) or pd.isna(file2_sum):
+                if pd.isna(total_value) or pd.isna(target_value):
                     numeric_match = False
                     break
 
-                if not apply_scalar_operator(file1_sum, file2_sum, operator):
+                if not apply_scalar_operator(target_value, total_value, operator):
                     numeric_match = False
                     break
 
             if numeric_match:
-                matched_df1_indices.update(df1_group.index.tolist())
+                matched_df1_indices.add(i1)
                 matched_df2_indices.update(df2_cast.index[base_mask].tolist())
-
-        unmatched_df1_indices = [i for i in df1.index if i not in matched_df1_indices]
-        matched = df2.loc[sorted(matched_df2_indices)].reset_index(drop=True)
-        unmatched = df1.loc[unmatched_df1_indices].copy()
-        return matched, unmatched
-
-    for i1, row1 in df1_cast.iterrows():
+            continue
 
         # Default behavior: row-wise criteria match.
         mask = pd.Series([True] * len(df2_cast), index=df2_cast.index)
@@ -373,94 +370,144 @@ def compare_dataframes(
     return matched, unmatched
 
 
-def _normalize_numeric_output(value):
-    """Return cleaner numeric values for output DataFrames."""
-    if pd.isna(value):
-        return value
-    float_value = float(value)
-    if float_value.is_integer():
-        return str(int(float_value))
-    return f"{float_value:g}"
+def adapt_criteria_for_input(base_criteria: list[dict], left_columns: list[str]) -> tuple[list[dict], list[str]]:
+    """Map criteria to columns available in current left-side input.
 
-
-def allocate_order_quantities(
-    df_orders: pd.DataFrame,
-    df_stock: pd.DataFrame,
-    criteria: list[dict],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Allocate order quantity from stock and return (allocated, remaining).
-
-    Uses non-number criteria to find matching stock rows and compares grouped
-    available quantity against required quantity. For each order row:
-    - allocated qty = min(required, available)
-    - remaining qty goes to next stock comparison step.
+    When chained unmatched input only has Drug Code / Remaining Qty,
+    remap criteria so comparison can continue across subsequent stock files.
     """
-    number_criteria = [c for c in criteria if c["datatype"] == "number"]
+    adapted = []
+    unresolved = []
+
+    for crit in base_criteria:
+        mapped_col1 = crit["col1"]
+        if mapped_col1 not in left_columns:
+            if crit["datatype"] == "number" and "Remaining Qty" in left_columns:
+                mapped_col1 = "Remaining Qty"
+            elif crit["datatype"] != "number" and "Drug Code" in left_columns:
+                mapped_col1 = "Drug Code"
+
+        if mapped_col1 not in left_columns:
+            unresolved.append(crit["col1"])
+            continue
+
+        mapped = dict(crit)
+        mapped["col1"] = mapped_col1
+        adapted.append(mapped)
+
+    return adapted, unresolved
+
+
+def build_unmatched_summary(
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    unmatched_rows: pd.DataFrame,
+    criteria: list[dict],
+) -> pd.DataFrame:
+    """Return unmatched rows in normalized shape: Drug Code + Remaining Qty.
+
+    Remaining Qty is computed as:
+      left numeric target - sum(right numeric values matched by non-number criteria)
+    clamped at zero.
+    """
+    if unmatched_rows.empty:
+        return pd.DataFrame(columns=["Drug Code", "Remaining Qty"])
+
+    if not criteria:
+        return pd.DataFrame(columns=["Drug Code", "Remaining Qty"])
+
+    left_cast = left_df.copy()
+    right_cast = right_df.copy()
+    for crit in criteria:
+        left_cast[crit["col1"]] = cast_series(left_cast[crit["col1"]], crit["datatype"])
+        right_cast[crit["col2"]] = cast_series(right_cast[crit["col2"]], crit["datatype"])
+
     non_number_criteria = [c for c in criteria if c["datatype"] != "number"]
+    number_criteria = [c for c in criteria if c["datatype"] == "number"]
+    primary_number = number_criteria[0] if number_criteria else None
 
-    # Quantity allocation requires exactly one numeric criterion.
-    # If key criteria are not provided, compare against the full stock pool.
-    if len(number_criteria) != 1:
-        _matched_df2, unmatched_df1 = compare_dataframes(df_orders, df_stock, criteria)
-        matched_indices = [i for i in df_orders.index if i not in unmatched_df1.index]
-        matched_orders = df_orders.loc[matched_indices].copy()
-        return matched_orders.reset_index(drop=True), unmatched_df1.reset_index(drop=True)
-
-    qty_criterion = number_criteria[0]
-    qty_col_order = qty_criterion["col1"]
-    qty_col_stock = qty_criterion["col2"]
-
-    orders_cast = df_orders.copy()
-    stock_cast = df_stock.copy()
-    for crit in non_number_criteria:
-        orders_cast[crit["col1"]] = cast_series(orders_cast[crit["col1"]], crit["datatype"])
-        stock_cast[crit["col2"]] = cast_series(stock_cast[crit["col2"]], crit["datatype"])
-
-    order_qty = pd.to_numeric(orders_cast[qty_col_order], errors="coerce")
-    stock_qty = pd.to_numeric(stock_cast[qty_col_stock], errors="coerce")
-
-    group_cols = list(dict.fromkeys(c["col1"] for c in non_number_criteria))
-    allocated_rows = []
-    remaining_rows = []
-
-    if group_cols:
-        grouped_orders = orders_cast.groupby(group_cols, dropna=False, sort=False)
+    if "Drug Code" in unmatched_rows.columns:
+        drug_code_col = "Drug Code"
+    elif non_number_criteria:
+        drug_code_col = non_number_criteria[0]["col1"]
     else:
-        grouped_orders = [("__all__", orders_cast)]
+        drug_code_col = unmatched_rows.columns[0]
 
-    for _group_key, order_group in grouped_orders:
-        stock_mask = pd.Series([True] * len(stock_cast), index=stock_cast.index)
-        for crit in non_number_criteria:
-            group_value = order_group.iloc[0][crit["col1"]]
-            stock_mask = stock_mask & apply_operator(stock_cast[crit["col2"]], group_value, crit["operator"])
+    records = []
+    for idx in unmatched_rows.index:
+        if idx not in left_cast.index:
+            continue
 
-        available_qty = pd.to_numeric(stock_qty.loc[stock_mask], errors="coerce").sum(min_count=1)
-        remaining_available = 0.0 if pd.isna(available_qty) else float(available_qty)
+        original_row = unmatched_rows.loc[idx]
+        left_row = left_cast.loc[idx]
 
-        for row_index in order_group.index:
-            required_qty = order_qty.loc[row_index]
-            if pd.isna(required_qty):
-                remaining_rows.append(df_orders.loc[row_index].copy())
-                continue
+        remaining_qty = None
+        if primary_number:
+            base_mask = pd.Series([True] * len(right_cast), index=right_cast.index)
+            for crit in non_number_criteria:
+                base_mask = base_mask & apply_operator(
+                    right_cast[crit["col2"]],
+                    left_row[crit["col1"]],
+                    crit["operator"],
+                )
 
-            required_qty_float = float(required_qty)
-            allocated_qty = min(required_qty_float, remaining_available)
-            remaining_available -= allocated_qty
+            total_series = (
+                right_cast.loc[base_mask, primary_number["col2"]]
+                .astype(str)
+                .str.replace(",", "", regex=False)
+                .str.strip()
+                .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+            )
+            total_value = pd.to_numeric(total_series, errors="coerce").sum(min_count=1)
+            target_value = pd.to_numeric(
+                pd.Series([left_row[primary_number["col1"]]])
+                .astype(str)
+                .str.replace(",", "", regex=False)
+                .str.strip()
+                .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA}),
+                errors="coerce",
+            ).iloc[0]
 
-            if allocated_qty > 0:
-                allocated_row = df_orders.loc[row_index].copy()
-                allocated_row[qty_col_order] = _normalize_numeric_output(allocated_qty)
-                allocated_rows.append(allocated_row)
+            if pd.notna(target_value):
+                if pd.notna(total_value):
+                    remaining_qty = max(float(target_value) - float(total_value), 0.0)
+                else:
+                    remaining_qty = float(target_value)
 
-            remaining_qty = required_qty_float - allocated_qty
-            if remaining_qty > 0:
-                remaining_row = df_orders.loc[row_index].copy()
-                remaining_row[qty_col_order] = _normalize_numeric_output(remaining_qty)
-                remaining_rows.append(remaining_row)
+        if remaining_qty is None:
+            if "Remaining Qty" in original_row:
+                remaining_qty = pd.to_numeric(
+                    pd.Series([original_row["Remaining Qty"]])
+                    .astype(str)
+                    .str.replace(",", "", regex=False)
+                    .str.strip()
+                    .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA}),
+                    errors="coerce",
+                ).iloc[0]
+            elif primary_number and primary_number["col1"] in original_row:
+                remaining_qty = pd.to_numeric(
+                    pd.Series([original_row[primary_number["col1"]]])
+                    .astype(str)
+                    .str.replace(",", "", regex=False)
+                    .str.strip()
+                    .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA}),
+                    errors="coerce",
+                ).iloc[0]
+            else:
+                remaining_qty = ""
 
-    allocated_df = pd.DataFrame(allocated_rows, columns=df_orders.columns)
-    remaining_df = pd.DataFrame(remaining_rows, columns=df_orders.columns)
-    return allocated_df.reset_index(drop=True), remaining_df.reset_index(drop=True)
+        records.append(
+            {
+                "Drug Code": str(original_row.get(drug_code_col, "")).strip(),
+                "Remaining Qty": remaining_qty,
+            }
+        )
+
+    summary_df = pd.DataFrame(records, columns=["Drug Code", "Remaining Qty"])
+    if not summary_df.empty:
+        qty_numeric = pd.to_numeric(summary_df["Remaining Qty"], errors="coerce")
+        summary_df["Remaining Qty"] = qty_numeric.where(qty_numeric.isna(), qty_numeric.round(6))
+    return summary_df
 
 
 # ---------------------------------------------------------------------------
@@ -849,12 +896,11 @@ def compare():
         )
 
     try:
-        remaining_working = df1.copy()
+        unmatched_working = df1.copy()
         per_step_results = []
-        allocated_all_steps = []
 
         for entry in comparison_entries:
-            if remaining_working.empty:
+            if unmatched_working.empty:
                 break
 
             df_compare = read_excel(os.path.join(UPLOAD_FOLDER, entry["stored"]))
@@ -875,9 +921,9 @@ def compare():
                     errors=[f"{entry['original']}: {exc}"],
                 )
 
-            missing_col1 = [c["col1"] for c in criteria if c["col1"] not in remaining_working.columns]
-            missing_col2 = [c["col2"] for c in criteria if c["col2"] not in df_compare.columns]
-            if missing_col1:
+            step_criteria, unresolved_left = adapt_criteria_for_input(criteria, list(unmatched_working.columns))
+            missing_col2 = [c["col2"] for c in step_criteria if c["col2"] not in df_compare.columns]
+            if not step_criteria:
                 return render_template(
                     "configure.html",
                     cols1=session.get("cols1", []),
@@ -889,7 +935,27 @@ def compare():
                     comparison_count=len(comparison_entries),
                     expiry_options=EXPIRY_WINDOW_OPTIONS,
                     selected_expiry_months=selected_expiry_months_int,
-                    errors=[f"Missing column(s) in File 1/unmatched data: {', '.join(sorted(set(missing_col1)))}"],
+                    errors=[
+                        "No valid criteria could be applied to chained unmatched data. "
+                        "Ensure criteria include Drug Code (string) and Remaining Qty (number)."
+                    ],
+                )
+            if unresolved_left:
+                return render_template(
+                    "configure.html",
+                    cols1=session.get("cols1", []),
+                    cols2=session.get("cols2", []),
+                    datatypes=DATATYPES,
+                    operators_json=json.dumps(OPERATORS),
+                    original1=session.get("original1", "File 1"),
+                    original2=session.get("original2", "File 2"),
+                    comparison_count=len(comparison_entries),
+                    expiry_options=EXPIRY_WINDOW_OPTIONS,
+                    selected_expiry_months=selected_expiry_months_int,
+                    errors=[
+                        "Missing column(s) in File 1/unmatched data: "
+                        f"{', '.join(sorted(set(unresolved_left)))}"
+                    ],
                 )
             if missing_col2:
                 return render_template(
@@ -909,34 +975,38 @@ def compare():
                     ],
                 )
 
-            current_orders = remaining_working.copy()
-            allocated_order, next_remaining = allocate_order_quantities(
-                current_orders,
+            current_unmatched_input = unmatched_working.copy()
+            _matched_df2, next_unmatched = compare_dataframes(
+                current_unmatched_input,
                 df_compare,
-                criteria,
+                step_criteria,
+            )
+            next_unmatched_summary = build_unmatched_summary(
+                current_unmatched_input,
+                df_compare,
+                next_unmatched,
+                step_criteria,
             )
 
-            # Step outputs remain order-side rows so the next step can compare
-            # against the new stock file using the same order schema.
+            # Matched output should contain comparison-side rows (File 2 perspective),
+            # including columns like Drug Code from the stock file.
             per_step_results.append(
                 {
                     "step": len(per_step_results) + 1,
                     "comparison_name": entry["original"],
-                    "matched": allocated_order.reset_index(drop=True),
-                    "unmatched": next_remaining.reset_index(drop=True),
+                    "matched": _matched_df2.reset_index(drop=True),
+                    "unmatched": next_unmatched_summary.reset_index(drop=True),
                 }
             )
-            if not allocated_order.empty:
-                allocated_all_steps.append(allocated_order.reset_index(drop=True))
 
-            remaining_working = next_remaining
+            unmatched_working = next_unmatched_summary
 
-        matched = (
-            pd.concat(allocated_all_steps, ignore_index=True)
-            if allocated_all_steps
-            else pd.DataFrame(columns=df1.columns)
-        )
-        unmatched = remaining_working.reset_index(drop=True)
+        if per_step_results:
+            matched = per_step_results[-1]["matched"]
+            unmatched = per_step_results[-1]["unmatched"]
+        else:
+            matched = pd.DataFrame(columns=df1.columns)
+            unmatched = df1.copy()
     except Exception as exc:  # noqa: BLE001
         return render_template(
             "configure.html",
@@ -968,24 +1038,6 @@ def compare():
         safe_root = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in root)
         return safe_root.strip("_") or fallback
 
-    def _dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False)
-        return excel_buffer.getvalue()
-
-    order_root = _safe_file_root(session.get("original1", "Order"), "Order")
-    order_copy_name = f"order_{order_root}_{timestamp}.xlsx"
-    matched_name = f"matched_{timestamp}.xlsx"
-    pending_name = "Pending.xlsx"
-
-    # Persist main outputs under outputs/ for local traceability.
-    for df, out_name in [
-        (df1, order_copy_name),
-        (unmatched, pending_name),
-    ]:
-        df.to_excel(os.path.join(OUTPUT_FOLDER, out_name), index=False)
-
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         used_names = set()
@@ -1006,18 +1058,44 @@ def compare():
 
         # Step-wise outputs for each pairwise comparison.
         for step_result in per_step_results:
+            label = _step_file_label(step_result["step"], step_result["comparison_name"])
             safe_root = _safe_file_root(step_result["comparison_name"], f"file{step_result['step'] + 1}")
             for df, name in [
                 (step_result["matched"], f"{safe_root}_Order.xlsx"),
+                (step_result["unmatched"], f"{safe_root}_Unmatched.xlsx"),
             ]:
-                zf.writestr(unique_name(name), _dataframe_to_excel_bytes(df))
+                excel_buffer = io.BytesIO()
+                with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                    df.to_excel(writer, index=False)
+                payload = excel_buffer.getvalue()
+                final_name = unique_name(name)
+                zf.writestr(final_name, payload)
+
+                if final_name.lower().endswith("_unmatched.xlsx"):
+                    output_path = os.path.join(OUTPUT_FOLDER, final_name)
+                    with open(output_path, "wb") as out_file:
+                        out_file.write(payload)
 
         # Backward-compatible aliases: final step result.
         for df, name in [
-            (matched, matched_name),
-            (unmatched, pending_name),
+            (matched, f"matched_{timestamp}.xlsx"),
+            (unmatched, f"unmatched_{timestamp}.xlsx"),
         ]:
-            zf.writestr(unique_name(name), _dataframe_to_excel_bytes(df))
+            excel_buffer = io.BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False)
+            zf.writestr(unique_name(name), excel_buffer.getvalue())
+
+    # Persist a copy of the original uploaded order file for traceability.
+    original_order_name = session.get("original1", "order.xlsx")
+    stable_initial_name = os.path.basename(original_order_name) or "order.xlsx"
+    shutil.copyfile(path1, os.path.join(OUTPUT_FOLDER, stable_initial_name))
+    shutil.copyfile(path1, os.path.join(OUTPUT_FOLDER, "order.xlsx"))
+
+    # Keep a timestamped snapshot as well to preserve historical runs.
+    initial_order_root = _safe_file_root(original_order_name, "order")
+    initial_order_name = f"{initial_order_root}_InitialOrder_{timestamp}.xlsx"
+    shutil.copyfile(path1, os.path.join(OUTPUT_FOLDER, initial_order_name))
 
     zip_buffer.seek(0)
     return send_file(

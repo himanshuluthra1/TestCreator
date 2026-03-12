@@ -14,6 +14,7 @@ from app import (
     apply_operator,
     apply_scalar_operator,
     compare_dataframes,
+    build_unmatched_summary,
     read_excel,
     OPERATORS,
     DATATYPES,
@@ -230,33 +231,6 @@ def test_compare_number_sum_with_other_criteria_no_match():
     assert list(unmatched["Product"]) == ["Mouse"]
 
 
-def test_compare_number_sum_groups_duplicate_keys_in_file1():
-    """When File 1 has duplicate keys, compare grouped SUM(file1) with SUM(file2)."""
-    df1 = pd.DataFrame(
-        {
-            "DrugCode": ["D001", "D001"],
-            "Warehouse": ["Delhi", "Delhi"],
-            "ExpectedQty": ["10", "15"],
-        }
-    )
-    df2 = pd.DataFrame(
-        {
-            "Drug Code": ["D001", "D001"],
-            "Location": ["Delhi", "Delhi"],
-            "StockQty": ["12", "13"],
-        }
-    )
-    criteria = [
-        {"col1": "DrugCode", "col2": "Drug Code", "datatype": "string", "operator": "eq"},
-        {"col1": "Warehouse", "col2": "Location", "datatype": "string", "operator": "eq"},
-        {"col1": "ExpectedQty", "col2": "StockQty", "datatype": "number", "operator": "eq"},
-    ]
-
-    matched, unmatched = compare_dataframes(df1, df2, criteria)
-    assert len(matched) == 2
-    assert unmatched.empty
-
-
 def test_compare_number_sum_lte_direction_regression():
     """Regression: ExpectedQty <= SUM(StockQty) should not match 80 <= 75."""
     df1 = pd.DataFrame(
@@ -293,6 +267,32 @@ def test_compare_no_match():
     matched, unmatched = compare_dataframes(df1, df2, criteria)
     assert matched.empty
     assert list(unmatched["Name"]) == ["Xavier"]
+
+
+def test_build_unmatched_summary_preserves_comma_formatted_remaining_qty():
+    left_df = pd.DataFrame(
+        {
+            "Drug Code": ["D001"],
+            "Remaining Qty": ["1,200"],
+        }
+    )
+    right_df = pd.DataFrame(
+        {
+            "Drug Code": ["D999"],
+            "StockQty": ["50"],
+        }
+    )
+    unmatched_rows = left_df.copy()
+    criteria = [
+        {"col1": "Drug Code", "col2": "Drug Code", "datatype": "string", "operator": "eq"},
+        {"col1": "Remaining Qty", "col2": "StockQty", "datatype": "number", "operator": "eq"},
+    ]
+
+    summary = build_unmatched_summary(left_df, right_df, unmatched_rows, criteria)
+
+    assert list(summary["Drug Code"]) == ["D001"]
+    assert pd.notna(summary.loc[0, "Remaining Qty"])
+    assert float(summary.loc[0, "Remaining Qty"]) == 1200.0
 
 
 # ---------------------------------------------------------------------------
@@ -468,29 +468,30 @@ def test_full_compare_flow(client):
     # Inspect the ZIP contents
     zf = zipfile.ZipFile(io.BytesIO(compare_resp.data))
     names = zf.namelist()
-    assert not any(n.startswith("order_") for n in names)
     assert any("matched" in n for n in names)
-    assert "Pending.xlsx" in names
+    assert any("unmatched" in n for n in names)
 
     matched_bytes = zf.read(next(n for n in names if n.startswith("matched_")))
-    unmatched_bytes = zf.read("Pending.xlsx")
+    unmatched_bytes = zf.read(next(n for n in names if n.startswith("unmatched_")))
 
     matched_df = pd.read_excel(io.BytesIO(matched_bytes))
     unmatched_df = pd.read_excel(io.BytesIO(unmatched_bytes))
 
-    assert set(matched_df["Name"]) == {"Alice", "Bob"}
-    assert list(unmatched_df["Name"]) == ["Dave"]
+    assert set(matched_df["FullName"]) == {"Alice", "Bob"}
+    assert list(unmatched_df["Drug Code"]) == ["Dave"]
 
     import app as app_module
-    output_files = os.listdir(app_module.OUTPUT_FOLDER)
-    assert any(name.startswith("order_") and name.endswith(".xlsx") for name in output_files)
+    saved_files = os.listdir(app_module.OUTPUT_FOLDER)
+    assert "order.xlsx" in saved_files
+    assert "file1.xlsx" in saved_files
+    assert any("_InitialOrder_" in name and name.endswith(".xlsx") for name in saved_files)
 
 
 def test_compare_generates_stepwise_outputs_for_multiple_files(client):
     """When multiple comparison files are uploaded, ZIP should include per-step outputs."""
     excel1 = _make_excel_bytes({"Name": ["Alice", "Bob", "Dave"]})
-    excel2 = _make_excel_bytes({"FullName": ["Alice", "Bob"], "Expiry Date": [_expiry_month_label(12), _expiry_month_label(12)]})
-    excel3 = _make_excel_bytes({"FullName": ["Bob"], "Expiry Date": [_expiry_month_label(13)]})
+    excel2 = _make_excel_bytes({"FullName": ["Alice"], "Expiry Date": [_expiry_month_label(1)]})
+    excel3 = _make_excel_bytes({"FullName": ["Bob"], "Expiry Date": [_expiry_month_label(2)]})
 
     upload_resp = client.post(
         "/upload",
@@ -522,97 +523,19 @@ def test_compare_generates_stepwise_outputs_for_multiple_files(client):
 
     # Step files for both comparison files should exist.
     assert any(n == "compare_2_Order.xlsx" for n in names)
+    assert any(n == "compare_2_Unmatched.xlsx" for n in names)
     assert any(n == "compare_3_Order.xlsx" for n in names)
-    assert not any("unmatched_step" in n for n in names)
+    assert any(n == "compare_3_Unmatched.xlsx" for n in names)
 
     # Final aliases should still exist.
     assert any(n.startswith("matched_") and "step" not in n for n in names)
-    assert "Pending.xlsx" in names
+    assert any(n.startswith("unmatched_") and "step" not in n for n in names)
 
-
-def test_compare_splits_required_qty_across_stock_files(client):
-    """Required qty should be allocated from each stock file, remainder carried forward."""
-    excel1 = _make_excel_bytes({"DrugCode": ["D001"], "ExpectedQty": [10]})
-    excel2 = _make_excel_bytes({"Drug Code": ["D001"], "StockQty": [6], "Expiry Date": [_expiry_month_label(12)]})
-    excel3 = _make_excel_bytes({"Drug Code": ["D001"], "StockQty": [4], "Expiry Date": [_expiry_month_label(12)]})
-
-    upload_resp = client.post(
-        "/upload",
-        data={
-            "file1": (io.BytesIO(excel1), "orders.xlsx"),
-            "file2": (io.BytesIO(excel2), "stock1.xlsx"),
-            "file3": (io.BytesIO(excel3), "stock2.xlsx"),
-        },
-        content_type="multipart/form-data",
-        follow_redirects=True,
-    )
-    assert upload_resp.status_code == 200
-
-    compare_resp = client.post(
-        "/compare",
-        data={
-            "col1_0": "DrugCode",
-            "col2_0": "Drug Code",
-            "datatype_0": "string",
-            "operator_0": "eq",
-            "col1_1": "ExpectedQty",
-            "col2_1": "StockQty",
-            "datatype_1": "number",
-            "operator_1": "eq",
-        },
-        follow_redirects=True,
-    )
-    assert compare_resp.status_code == 200
-    assert compare_resp.content_type == "application/zip"
-
-    zf = zipfile.ZipFile(io.BytesIO(compare_resp.data))
-    step1_alloc = pd.read_excel(io.BytesIO(zf.read("stock1_Order.xlsx")))
-    step2_alloc = pd.read_excel(io.BytesIO(zf.read("stock2_Order.xlsx")))
-    final_unmatched = pd.read_excel(io.BytesIO(zf.read("Pending.xlsx")))
-
-    assert list(step1_alloc["ExpectedQty"]) == [6]
-    assert list(step2_alloc["ExpectedQty"]) == [4]
-    assert final_unmatched.empty
-
-
-def test_compare_splits_qty_across_stock_files_with_only_number_criterion(client):
-    excel1 = _make_excel_bytes({"ExpectedQty": [10]})
-    excel2 = _make_excel_bytes({"StockQty": [6], "Expiry Date": [_expiry_month_label(12)]})
-    excel3 = _make_excel_bytes({"StockQty": [4], "Expiry Date": [_expiry_month_label(12)]})
-
-    upload_resp = client.post(
-        "/upload",
-        data={
-            "file1": (io.BytesIO(excel1), "orders.xlsx"),
-            "file2": (io.BytesIO(excel2), "stock1.xlsx"),
-            "file3": (io.BytesIO(excel3), "stock2.xlsx"),
-        },
-        content_type="multipart/form-data",
-        follow_redirects=True,
-    )
-    assert upload_resp.status_code == 200
-
-    compare_resp = client.post(
-        "/compare",
-        data={
-            "col1_0": "ExpectedQty",
-            "col2_0": "StockQty",
-            "datatype_0": "number",
-            "operator_0": "eq",
-        },
-        follow_redirects=True,
-    )
-    assert compare_resp.status_code == 200
-    assert compare_resp.content_type == "application/zip"
-
-    zf = zipfile.ZipFile(io.BytesIO(compare_resp.data))
-    step1_alloc = pd.read_excel(io.BytesIO(zf.read("stock1_Order.xlsx")))
-    step2_alloc = pd.read_excel(io.BytesIO(zf.read("stock2_Order.xlsx")))
-    final_unmatched = pd.read_excel(io.BytesIO(zf.read("Pending.xlsx")))
-
-    assert list(step1_alloc["ExpectedQty"]) == [6]
-    assert list(step2_alloc["ExpectedQty"]) == [4]
-    assert final_unmatched.empty
+    # Per-step unmatched should be persisted in outputs/ as well.
+    import app as app_module
+    saved_files = os.listdir(app_module.OUTPUT_FOLDER)
+    assert "compare_2_Unmatched.xlsx" in saved_files
+    assert "compare_3_Unmatched.xlsx" in saved_files
 
 
 def test_compare_applies_expiry_window_filter(client):
@@ -652,13 +575,13 @@ def test_compare_applies_expiry_window_filter(client):
     zf = zipfile.ZipFile(io.BytesIO(compare_resp.data))
     names = zf.namelist()
     matched_bytes = zf.read(next(n for n in names if n.startswith("matched_")))
-    unmatched_bytes = zf.read("Pending.xlsx")
+    unmatched_bytes = zf.read(next(n for n in names if n.startswith("unmatched_")))
 
     matched_df = pd.read_excel(io.BytesIO(matched_bytes))
     unmatched_df = pd.read_excel(io.BytesIO(unmatched_bytes))
 
-    assert list(matched_df["Name"]) == ["Bob"]
-    assert list(unmatched_df["Name"]) == ["Alice"]
+    assert list(matched_df["FullName"]) == ["Bob"]
+    assert list(unmatched_df["Drug Code"]) == ["Alice"]
 
 
 def test_compare_applies_expiry_window_filter_mmddyyyy_format(client):
@@ -698,60 +621,13 @@ def test_compare_applies_expiry_window_filter_mmddyyyy_format(client):
     zf = zipfile.ZipFile(io.BytesIO(compare_resp.data))
     names = zf.namelist()
     matched_bytes = zf.read(next(n for n in names if n.startswith("matched_")))
-    unmatched_bytes = zf.read("Pending.xlsx")
+    unmatched_bytes = zf.read(next(n for n in names if n.startswith("unmatched_")))
 
     matched_df = pd.read_excel(io.BytesIO(matched_bytes))
     unmatched_df = pd.read_excel(io.BytesIO(unmatched_bytes))
 
-    assert list(matched_df["Name"]) == ["Bob"]
-    assert list(unmatched_df["Name"]) == ["Alice"]
-
-
-def test_compare_skips_expiry_filter_when_column_missing(client):
-    excel1 = _make_excel_bytes({"Name": ["Alice", "Bob"]})
-    excel2 = _make_excel_bytes(
-        {
-            "FullName": ["Alice", "Bob"],
-            # No Expiry Date column in this stock file.
-            "StockQty": [5, 7],
-        }
-    )
-
-    upload_resp = client.post(
-        "/upload",
-        data={
-            "file1": (io.BytesIO(excel1), "orders.xlsx"),
-            "file2": (io.BytesIO(excel2), "compare_no_expiry.xlsx"),
-        },
-        content_type="multipart/form-data",
-        follow_redirects=True,
-    )
-    assert upload_resp.status_code == 200
-
-    compare_resp = client.post(
-        "/compare",
-        data={
-            "expiry_window": "3",
-            "col1_0": "Name",
-            "col2_0": "FullName",
-            "datatype_0": "string",
-            "operator_0": "eq",
-        },
-        follow_redirects=True,
-    )
-    assert compare_resp.status_code == 200
-    assert compare_resp.content_type == "application/zip"
-
-    zf = zipfile.ZipFile(io.BytesIO(compare_resp.data))
-    names = zf.namelist()
-    matched_bytes = zf.read(next(n for n in names if n.startswith("matched_")))
-    unmatched_bytes = zf.read("Pending.xlsx")
-
-    matched_df = pd.read_excel(io.BytesIO(matched_bytes))
-    unmatched_df = pd.read_excel(io.BytesIO(unmatched_bytes))
-
-    assert set(matched_df["Name"]) == {"Alice", "Bob"}
-    assert unmatched_df.empty
+    assert list(matched_df["FullName"]) == ["Bob"]
+    assert list(unmatched_df["Drug Code"]) == ["Alice"]
 
 
 def test_download_input_file_after_upload(client):
