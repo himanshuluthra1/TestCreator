@@ -1,0 +1,44 @@
+# Hostinger Shared Hosting – Apache configuration for Flask (Passenger WSGI)
+# Place this file in the domain/application root directory.
+
+# Enable Passenger for Python WSGI
+PassengerEnabled On
+PassengerAppRoot /home/YOUR_USERNAME/public_html
+PassengerAppType wsgi
+PassengerStartupFile passenger_wsgi.py
+
+# Serve static files directly by Apache (bypasses Python)
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_URI} !^/static/
+RewriteRule ^(.*)$ passenger_wsgi.py/$1 [QSA,L]
+
+# Serve static assets directly
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^static/(.*)$ static/$1 [L]
+</IfModule>
+
+# Prevent direct access to sensitive files
+<FilesMatch "^(app\.py|requirements\.txt|passenger_wsgi\.py|\.env|setup_venv\.sh)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+# Allow access to uploads and outputs directories (for generated files)
+<Directory "uploads">
+    Order allow,deny
+    Allow from all
+</Directory>
+
+<Directory "outputs">
+    Order allow,deny
+    Allow from all
+</Directory>
+
+# Security headers
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always set X-XSS-Protection "1; mode=block"
+</IfModule>
