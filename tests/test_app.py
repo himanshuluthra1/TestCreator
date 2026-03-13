@@ -346,7 +346,7 @@ def test_index_get(client):
 def test_order_creator_page_get(client):
     resp = client.get("/order-creator")
     assert resp.status_code == 200
-    assert b"Excel File Comparator" in resp.data
+    assert b"PMBI Order Creator" in resp.data
 
 
 def test_stock_checker_page_get(client):
